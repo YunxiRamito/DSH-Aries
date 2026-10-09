@@ -1,0 +1,15 @@
+.tools/
+temp/
+.local/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.pid
+secrets/
+*.token
+
+# Local operational/agent notes are not part of the public source release.
+AGENTS.md
+HANDOFF.md
+DSH-服务微端-设计大纲.md
