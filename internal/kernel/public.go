@@ -407,13 +407,97 @@ func (s *Server) applicationStatus(w http.ResponseWriter, r *http.Request) {
 				return fail(403, "membership_required", "application owner or active group membership is required")
 			}
 		}
-		writeJSON(w, 200, map[string]any{"application_id": app.ID, "device_id": app.DeviceID, "status": app.Status, "approvals": app.Approvals, "updated_at": app.UpdatedAt})
+		publicKey, ok := registeredDevicePublicKey(st, app.DeviceID)
+		if !ok {
+			return fail(500, "device_identity_missing", "application device identity is not registered")
+		}
+		writeJSON(w, 200, map[string]any{"application_id": app.ID, "device_id": app.DeviceID, "public_key": publicKey, "status": app.Status, "approvals": app.Approvals, "created_at": app.CreatedAt, "updated_at": app.UpdatedAt})
 		return nil
 	})
 	if err != nil {
 		status, code, msg := httpError(err)
 		writeError(w, r, status, code, msg)
 	}
+}
+
+// applicationList returns applications for an active group member. The
+// default status filter deliberately excludes terminal applications so a
+// launcher can poll this endpoint without receiving stale history.
+func (s *Server) applicationList(w http.ResponseWriter, r *http.Request) {
+	device, _, ok := s.authorizedBody(w, r)
+	if !ok {
+		return
+	}
+	group := r.PathValue("group")
+	limit := parseLimit(r, 100, 200)
+	statuses, err := applicationStatusFilter(r)
+	if err != nil {
+		status, code, msg := httpError(err)
+		writeError(w, r, status, code, msg)
+		return
+	}
+	after, err := decodeApplicationCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		status, code, msg := httpError(err)
+		writeError(w, r, status, code, msg)
+		return
+	}
+
+	type applicationItem struct {
+		ApplicationID string `json:"application_id"`
+		DeviceID      string `json:"device_id"`
+		PublicKey     string `json:"public_key"`
+		Status        string `json:"status"`
+		CreatedAt     string `json:"created_at"`
+		UpdatedAt     string `json:"updated_at"`
+	}
+	items := make([]applicationItem, 0)
+	nextCursor := ""
+	err = s.store.View(func(st store.State) error {
+		g, ok := st.Groups[group]
+		if !ok {
+			return fail(404, "group_not_found", "group not found")
+		}
+		member, ok := g.Members[device]
+		if !ok || !member.Active {
+			return fail(403, "membership_required", "active group membership is required")
+		}
+		apps := make([]store.Application, 0)
+		for _, app := range st.Applications {
+			if app.GroupID != group || !statuses[app.Status] || !applicationAfterCursor(app, after) {
+				continue
+			}
+			apps = append(apps, app)
+		}
+		sort.Slice(apps, func(i, j int) bool {
+			if apps[i].CreatedAt == apps[j].CreatedAt {
+				return apps[i].ID < apps[j].ID
+			}
+			return apps[i].CreatedAt < apps[j].CreatedAt
+		})
+		hasMore := len(apps) > limit
+		if len(apps) > limit {
+			apps = apps[:limit]
+		}
+		for _, app := range apps {
+			publicKey, ok := registeredDevicePublicKey(st, app.DeviceID)
+			if !ok {
+				return fail(500, "device_identity_missing", "application device identity is not registered")
+			}
+			items = append(items, applicationItem{ApplicationID: app.ID, DeviceID: app.DeviceID, PublicKey: publicKey, Status: app.Status, CreatedAt: app.CreatedAt, UpdatedAt: app.UpdatedAt})
+		}
+		if hasMore && len(apps) > 0 {
+			last := apps[len(apps)-1]
+			nextCursor = encodeApplicationCursor(last.CreatedAt, last.ID)
+		}
+		return nil
+	})
+	if err != nil {
+		status, code, msg := httpError(err)
+		writeError(w, r, status, code, msg)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"items": items, "next_cursor": nextCursor})
 }
 
 func (s *Server) approveApplication(w http.ResponseWriter, r *http.Request) {
@@ -896,7 +980,7 @@ func (s *Server) memberList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	group := r.PathValue("group")
-	items := []store.Member{}
+	items := []map[string]any{}
 	err := s.store.View(func(st store.State) error {
 		g, ok := st.Groups[group]
 		if !ok {
@@ -908,10 +992,14 @@ func (s *Server) memberList(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, member := range g.Members {
 			if member.Active {
-				items = append(items, member)
+				publicKey, ok := registeredDevicePublicKey(st, member.DeviceID)
+				if !ok {
+					return fail(500, "device_identity_missing", "member device identity is not registered")
+				}
+				items = append(items, map[string]any{"device_id": member.DeviceID, "public_key": publicKey, "role": member.Role, "active": member.Active, "joined_at": member.JoinedAt})
 			}
 		}
-		sort.Slice(items, func(i, j int) bool { return items[i].DeviceID < items[j].DeviceID })
+		sort.Slice(items, func(i, j int) bool { return items[i]["device_id"].(string) < items[j]["device_id"].(string) })
 		return nil
 	})
 	if err != nil {
@@ -920,6 +1008,80 @@ func (s *Server) memberList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"items": items})
+}
+
+type applicationCursor struct {
+	CreatedAt string
+	ID        string
+}
+
+func registeredDevicePublicKey(st store.State, deviceID string) (string, bool) {
+	device, ok := st.Devices[deviceID]
+	if !ok || device.ID != deviceID || device.PublicKey == "" {
+		return "", false
+	}
+	return device.PublicKey, true
+}
+
+func applicationStatusFilter(r *http.Request) (map[string]bool, error) {
+	values := r.URL.Query()["status"]
+	if len(values) == 0 {
+		return map[string]bool{"pending_approval": true, "awaiting_key": true}, nil
+	}
+	filter := map[string]bool{}
+	for _, value := range values {
+		for _, status := range strings.Split(value, ",") {
+			status = strings.TrimSpace(status)
+			if status == "" {
+				continue
+			}
+			if status == "all" {
+				return map[string]bool{"pending_approval": true, "awaiting_key": true, "approved": true, "rejected": true}, nil
+			}
+			switch status {
+			case "pending_approval", "awaiting_key", "approved", "rejected":
+				filter[status] = true
+			default:
+				return nil, fail(400, "invalid_status", "status must be pending_approval, awaiting_key, approved, rejected, or all")
+			}
+		}
+	}
+	if len(filter) == 0 {
+		return nil, fail(400, "invalid_status", "status must not be empty")
+	}
+	return filter, nil
+}
+
+func encodeApplicationCursor(createdAt, id string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(createdAt + "\x00" + id))
+}
+
+func decodeApplicationCursor(value string) (applicationCursor, error) {
+	if value == "" {
+		return applicationCursor{}, nil
+	}
+	b, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return applicationCursor{}, fail(400, "invalid_cursor", "cursor is invalid")
+	}
+	parts := strings.Split(string(b), "\x00")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return applicationCursor{}, fail(400, "invalid_cursor", "cursor is invalid")
+	}
+	if _, err := time.Parse(time.RFC3339, parts[0]); err != nil {
+		return applicationCursor{}, fail(400, "invalid_cursor", "cursor is invalid")
+	}
+	return applicationCursor{CreatedAt: parts[0], ID: parts[1]}, nil
+}
+
+func applicationAfterCursor(app store.Application, cursor applicationCursor) bool {
+	if cursor.ID == "" {
+		return true
+	}
+	if app.CreatedAt == cursor.CreatedAt {
+		return app.ID > cursor.ID
+	}
+	return app.CreatedAt > cursor.CreatedAt
 }
 
 func (s *Server) completeRotation(w http.ResponseWriter, r *http.Request) {

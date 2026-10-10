@@ -11,6 +11,7 @@ esac
 
 release_dir="$project_root/temp/releases"
 mkdir -p "$release_dir"
+rm -f "$release_dir"/aries-server-* "$release_dir"/ariesctl-* "$release_dir/SHA256SUMS.txt"
 
 for target in linux-amd64 linux-arm64 windows-amd64; do
   goos=${target%-*}

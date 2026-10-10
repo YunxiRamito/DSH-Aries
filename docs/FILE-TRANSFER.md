@@ -38,6 +38,10 @@ All paths below are under `/api/v1/public`; every request needs the normal Ed255
 
 6. The sender, group admin, or creator may remove a transfer with `DELETE /groups/{group}/file-transfers/{file}`. `GET /groups/{group}/file-transfers` lists transfer metadata, resumable indexes, acknowledgements, state, and tombstone reason. Pagination uses `offset` and `limit`.
 
+7. A current active group member can inspect only that group's cache with `GET /groups/{group}/file-transfers/cache`. The response separates `uploading`, `available`, `cleanup_pending`, and `logical_deleted` buckets; each bucket has `count` and logical `bytes`, and `physical_bytes` reports the on-disk bytes belonging to that group's transfer cache.
+
+8. A sender, creator, or admin can request bounded cleanup with `POST /groups/{group}/file-transfers/cache/cleanup` and `{"file_ids":["ft_..."]}`. A batch contains at most 100 IDs and requires the normal device proof plus `Idempotency-Key`. Ordinary members may select only files they sent; creator/admin permissions follow the single-file delete rule. All IDs must belong to the requested group or the batch fails. The server commits tombstones first, removes only the selected blob/upload paths, and returns `logical_deleted`, `already_deleted`, `cleanup_pending`, and `physical_cleanup_complete`. The operation never deletes group membership, device identities, key deliveries, control events, or files in another group.
+
 Expired, explicitly removed, fully acknowledged, and quota-evicted transfers keep a metadata tombstone. A later fetch returns `410 file_unavailable` with a message that the source has no cached copy and a member must upload a fresh copy. Tombstones distinguish this from a missing ID.
 
 ## Quota and durability behavior

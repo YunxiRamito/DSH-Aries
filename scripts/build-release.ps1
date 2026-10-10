@@ -15,6 +15,9 @@ if (-not (Test-Path -LiteralPath $goExe)) {
 
 $releaseDir = Join-Path $projectRoot 'temp/releases'
 New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+Get-ChildItem -LiteralPath $releaseDir -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like 'aries-server-*' -or $_.Name -like 'ariesctl-*' -or $_.Name -eq 'SHA256SUMS.txt' } |
+    Remove-Item -Force
 
 foreach ($target in @(
     @{ GOOS = 'linux'; GOARCH = 'amd64'; Suffix = '' },

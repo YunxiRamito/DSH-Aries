@@ -9,6 +9,7 @@ This is the shared contract for Aries server-kernel and CLI work. Update it when
 - This stage does not implement an Android/PC client or the DSH plugin. We will build the DSH plugin after the kernel, public protocol, and CLI have passed integration checks.
 - Public API versions are explicit (`/api/v1/...`). Breaking wire changes require a new API version.
 - A device has a client-held signing private key and a server-registered public identity. Group membership authorization is separate, per device, and revocable. Revoking one device must not revoke other devices or the device's membership in other groups.
+- The group model remains general-purpose and supports any number of active members. A two-member group is a launcher presentation choice, not a server-enforced limit; do not add or infer max_members.
 - The server stores and relays opaque end-to-end encrypted message, file, and key-delivery payloads. It never stores a plaintext content key.
 - The authoritative group node commits membership changes. A connected relay must durably queue a leave request if the authority is unavailable. Once leave is confirmed, the authority durably queues a key-rotation control event until a remaining member handles it. Control events are not subject to file TTL, quota, or eviction.
 - On reconnect, an active member receives pending control events before ordinary new-content synchronization. The client handles rotation and submits encrypted key-delivery envelopes before publishing new-generation content.
@@ -44,6 +45,12 @@ Responses are JSON objects. Collection responses use `{"items":[...]}`. Status i
 
 The public API also exposes unauthenticated `GET /api/v1/public/node`, which returns `api_version`, persistent full `node_id`, and the four-character display `server_code`. The display code can collide; protocol identity and server selection use the full node ID. The current invitation code uses the display code as its prefix.
 
+The public pairing surface includes the group application list endpoint. It is restricted to active members and supports a bounded status filter, opaque cursor, and limit (default 100, maximum 200). It defaults to pending_approval and awaiting_key, sorts by created_at then application_id, and returns the registered applicant public key. Existing application detail and member list responses carry the same identity-bound public key.
+
+Presence uses a signed device heartbeat endpoint and an active-member-only group presence endpoint. The server timestamps receipt and computes expiry; clients cannot assert online. Presence is memory-only, capped at 100,000 records, pruned after the configured timeout, and cleared on restart. Defaults are a 30-second heartbeat interval and 90-second timeout; heartbeat_interval_seconds and heartbeat_timeout_seconds are configuration fields, with zero meaning default.
+
+Group file-cache support provides group-scoped statistics and idempotent batch cleanup. Statistics distinguish uploading, available, cleanup-pending, and logical-deleted records and report physical bytes. Cleanup accepts at most 100 file IDs, commits tombstones before physical removal, enforces existing sender/creator/admin permissions, and cannot remove membership, device identities, key deliveries, control events, or another group's files.
+
 The initial writable config uses these stable JSON fields:
 
 ```json
@@ -59,13 +66,15 @@ The initial writable config uses these stable JSON fields:
   "group_quota_bytes": 1073741824,
   "quota_bytes_per_member": 0,
   "max_file_bytes": 268435456,
-  "max_file_ttl_seconds": 2592000
+  "max_file_ttl_seconds": 2592000,
+  "heartbeat_interval_seconds": 30,
+  "heartbeat_timeout_seconds": 90
 }
 ```
 
 `peer_relay_enabled` is currently configuration-only. Setting it does not connect to peers or relay traffic; status reports `peer_relay_state: not_implemented` when enabled.
 
-`allow_insecure_loopback` only permits plaintext HTTP on loopback during development. Remote production admin access requires TLS. `file_storage_enabled` is the global feature gate for all public transfer operations; disabling it blocks access but does not itself erase cached blobs, which remain subject to normal TTL cleanup. `group_quota_bytes` is the fixed per-group limit, and a positive `quota_bytes_per_member` overrides it as a member-based quota. `max_file_bytes` and `max_file_ttl_seconds` cap an individual upload. A zero value disables that numeric cap. Additional TLS certificate/key configuration may be added as documented optional fields. Keep these names consistent in kernel, config output, and CLI `config set`.
+`allow_insecure_loopback` only permits plaintext HTTP on loopback during development. Remote production admin access requires TLS. `file_storage_enabled` is the global feature gate for all public transfer operations; disabling it blocks access but does not itself erase cached blobs, which remain subject to normal TTL cleanup. `group_quota_bytes` is the fixed per-group limit, and a positive `quota_bytes_per_member` overrides it as a member-based quota. `max_file_bytes` and `max_file_ttl_seconds` cap an individual upload. A zero value disables that numeric cap. `heartbeat_interval_seconds` and `heartbeat_timeout_seconds` control signed device heartbeats and group presence; timeout must be at least interval when both are non-zero, and values are bounded by the server. Additional TLS certificate/key configuration may be added as documented optional fields. Keep these names consistent in kernel, config output, and CLI `config set`.
 
 ## Canonical instruction system
 

@@ -15,36 +15,40 @@ import (
 // Config is the stable configuration contract shared with server-management
 // clients. The token itself is never stored here; only its file path is.
 type Config struct {
-	SchemaVersion         int    `json:"schema_version"`
-	PublicListen          string `json:"public_listen"`
-	AdminListen           string `json:"admin_listen"`
-	DataDir               string `json:"data_dir"`
-	AdminTokenFile        string `json:"admin_token_file"`
-	MaxStorageBytes       int64  `json:"max_storage_bytes"`
-	AllowInsecureLoopback bool   `json:"allow_insecure_loopback"`
-	PeerRelayEnabled      bool   `json:"peer_relay_enabled"`
-	FileStorageEnabled    bool   `json:"file_storage_enabled"`
-	GroupQuotaBytes       int64  `json:"group_quota_bytes"`
-	QuotaBytesPerMember   int64  `json:"quota_bytes_per_member"`
-	MaxFileBytes          int64  `json:"max_file_bytes"`
-	MaxFileTTLSeconds     int64  `json:"max_file_ttl_seconds"`
+	SchemaVersion            int    `json:"schema_version"`
+	PublicListen             string `json:"public_listen"`
+	AdminListen              string `json:"admin_listen"`
+	DataDir                  string `json:"data_dir"`
+	AdminTokenFile           string `json:"admin_token_file"`
+	MaxStorageBytes          int64  `json:"max_storage_bytes"`
+	AllowInsecureLoopback    bool   `json:"allow_insecure_loopback"`
+	PeerRelayEnabled         bool   `json:"peer_relay_enabled"`
+	FileStorageEnabled       bool   `json:"file_storage_enabled"`
+	GroupQuotaBytes          int64  `json:"group_quota_bytes"`
+	QuotaBytesPerMember      int64  `json:"quota_bytes_per_member"`
+	MaxFileBytes             int64  `json:"max_file_bytes"`
+	MaxFileTTLSeconds        int64  `json:"max_file_ttl_seconds"`
+	HeartbeatIntervalSeconds int64  `json:"heartbeat_interval_seconds"`
+	HeartbeatTimeoutSeconds  int64  `json:"heartbeat_timeout_seconds"`
 }
 
 func DefaultConfig() Config {
 	return Config{
-		SchemaVersion:         1,
-		PublicListen:          "127.0.0.1:8787",
-		AdminListen:           "127.0.0.1:8788",
-		DataDir:               "./data",
-		AdminTokenFile:        "./secrets/admin.token",
-		MaxStorageBytes:       1024 * 1024 * 1024,
-		AllowInsecureLoopback: true,
-		PeerRelayEnabled:      false,
-		FileStorageEnabled:    true,
-		GroupQuotaBytes:       1024 * 1024 * 1024,
-		QuotaBytesPerMember:   0,
-		MaxFileBytes:          256 * 1024 * 1024,
-		MaxFileTTLSeconds:     30 * 24 * 60 * 60,
+		SchemaVersion:            1,
+		PublicListen:             "127.0.0.1:8787",
+		AdminListen:              "127.0.0.1:8788",
+		DataDir:                  "./data",
+		AdminTokenFile:           "./secrets/admin.token",
+		MaxStorageBytes:          1024 * 1024 * 1024,
+		AllowInsecureLoopback:    true,
+		PeerRelayEnabled:         false,
+		FileStorageEnabled:       true,
+		GroupQuotaBytes:          1024 * 1024 * 1024,
+		QuotaBytesPerMember:      0,
+		MaxFileBytes:             256 * 1024 * 1024,
+		MaxFileTTLSeconds:        30 * 24 * 60 * 60,
+		HeartbeatIntervalSeconds: 30,
+		HeartbeatTimeoutSeconds:  90,
 	}
 }
 
@@ -106,6 +110,18 @@ func (c Config) Validate() error {
 	}
 	if c.GroupQuotaBytes < 0 || c.QuotaBytesPerMember < 0 || c.MaxFileBytes < 0 || c.MaxFileTTLSeconds < 0 {
 		fields = append(fields, "file quotas, max_file_bytes, and max_file_ttl_seconds must be non-negative")
+	}
+	if c.HeartbeatIntervalSeconds < 0 || c.HeartbeatTimeoutSeconds < 0 {
+		fields = append(fields, "heartbeat_interval_seconds and heartbeat_timeout_seconds must be non-negative")
+	}
+	if c.HeartbeatIntervalSeconds > 24*60*60 {
+		fields = append(fields, "heartbeat_interval_seconds must not exceed 86400")
+	}
+	if c.HeartbeatTimeoutSeconds > 7*24*60*60 {
+		fields = append(fields, "heartbeat_timeout_seconds must not exceed 604800")
+	}
+	if c.HeartbeatIntervalSeconds > 0 && c.HeartbeatTimeoutSeconds > 0 && c.HeartbeatTimeoutSeconds < c.HeartbeatIntervalSeconds {
+		fields = append(fields, "heartbeat_timeout_seconds must be at least heartbeat_interval_seconds")
 	}
 	if len(fields) > 0 {
 		return fmt.Errorf("invalid configuration: %s", strings.Join(fields, "; "))

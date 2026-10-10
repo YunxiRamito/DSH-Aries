@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,7 +152,7 @@ func TestAdminAuthConfigRedactionAndStatusContract(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &cfg); err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"schema_version", "public_listen", "admin_listen", "data_dir", "admin_token_file", "max_storage_bytes", "allow_insecure_loopback", "peer_relay_enabled", "file_storage_enabled", "group_quota_bytes", "quota_bytes_per_member", "max_file_bytes", "max_file_ttl_seconds"} {
+	for _, field := range []string{"schema_version", "public_listen", "admin_listen", "data_dir", "admin_token_file", "max_storage_bytes", "allow_insecure_loopback", "peer_relay_enabled", "file_storage_enabled", "group_quota_bytes", "quota_bytes_per_member", "max_file_bytes", "max_file_ttl_seconds", "heartbeat_interval_seconds", "heartbeat_timeout_seconds"} {
 		if _, ok := cfg[field]; !ok {
 			t.Errorf("config missing %s", field)
 		}
@@ -294,6 +295,87 @@ func TestChallengeRateLimitAndInvalidProof(t *testing.T) {
 	w = n.request(http.MethodPost, "/api/v1/public/devices/enroll", []byte(`{"challenge_id":"missing","signature":"invalid"}`), map[string]string{"Idempotency-Key": "invalid-enroll-01"})
 	if w.Code != 401 {
 		t.Fatalf("invalid challenge accepted: %d", w.Code)
+	}
+}
+
+func TestApplicationListAndPublicKeyBoundaries(t *testing.T) {
+	n := newTestNode(t)
+	defer n.close(t)
+	a := n.enroll(t)
+	b := n.enroll(t)
+	c := n.enroll(t)
+	if err := n.st.Update(func(st *store.State) error {
+		st.Groups["grp_apps"] = store.Group{ID: "grp_apps", Name: "apps", AuthorityNode: st.NodeID, CreatorID: a.id, Policy: "creator", CreatedAt: "2026-10-11T00:00:00Z", Generation: 1, Members: map[string]store.Member{
+			a.id: {DeviceID: a.id, Role: "creator", Active: true, JoinedAt: "2026-10-11T00:00:00Z"},
+			b.id: {DeviceID: b.id, Role: "member", Active: true, JoinedAt: "2026-10-11T00:00:00Z"},
+		}, Rotations: map[string]store.Rotation{}}
+		st.Groups["grp_other"] = store.Group{ID: "grp_other", Name: "other", AuthorityNode: st.NodeID, CreatorID: c.id, Policy: "creator", CreatedAt: "2026-10-11T00:00:00Z", Generation: 1, Members: map[string]store.Member{
+			c.id: {DeviceID: c.id, Role: "creator", Active: true, JoinedAt: "2026-10-11T00:00:00Z"},
+		}, Rotations: map[string]store.Rotation{}}
+		st.Applications["app_0001"] = store.Application{ID: "app_0001", GroupID: "grp_apps", DeviceID: c.id, Status: "pending_approval", CreatedAt: "2026-10-11T00:00:01Z", UpdatedAt: "2026-10-11T00:00:01Z", Approvals: map[string]bool{a.id: false}}
+		st.Applications["app_0002"] = store.Application{ID: "app_0002", GroupID: "grp_apps", DeviceID: b.id, Status: "awaiting_key", CreatedAt: "2026-10-11T00:00:02Z", UpdatedAt: "2026-10-11T00:00:02Z", Approvals: map[string]bool{a.id: true}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if w := n.request(http.MethodGet, "/api/v1/public/groups/grp_apps/applications", nil, nil); w.Code != 401 {
+		t.Fatalf("anonymous application list status: %d %s", w.Code, w.Body)
+	}
+	path := "/api/v1/public/groups/grp_apps/applications?limit=1"
+	w := n.signedRequest(t, a, http.MethodGet, path, nil, "application-list-1")
+	if w.Code != 200 {
+		t.Fatalf("application list: %d %s", w.Code, w.Body)
+	}
+	first := decodeMap(t, w)
+	items := first["items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["application_id"] != "app_0001" {
+		t.Fatalf("unexpected first application page: %#v", first)
+	}
+	item := items[0].(map[string]any)
+	if item["public_key"] != base64.RawURLEncoding.EncodeToString(c.pub) || item["status"] != "pending_approval" {
+		t.Fatalf("application identity/status mismatch: %#v", item)
+	}
+	cursor := first["next_cursor"].(string)
+	if cursor == "" {
+		t.Fatal("application list did not return a next cursor")
+	}
+	w = n.signedRequest(t, a, http.MethodGet, "/api/v1/public/groups/grp_apps/applications?limit=1&cursor="+url.QueryEscape(cursor), nil, "application-list-2")
+	if w.Code != 200 {
+		t.Fatalf("application list cursor: %d %s", w.Code, w.Body)
+	}
+	second := decodeMap(t, w)["items"].([]any)
+	if len(second) != 1 || second[0].(map[string]any)["application_id"] != "app_0002" {
+		t.Fatalf("unexpected second application page: %#v", second)
+	}
+	w = n.signedRequest(t, a, http.MethodGet, "/api/v1/public/groups/grp_apps/applications/app_0001", nil, "application-detail-1")
+	if w.Code != 200 {
+		t.Fatalf("application detail: %d %s", w.Code, w.Body)
+	}
+	detail := decodeMap(t, w)
+	if detail["public_key"] != base64.RawURLEncoding.EncodeToString(c.pub) || detail["created_at"] != "2026-10-11T00:00:01Z" {
+		t.Fatalf("application detail identity mismatch: %#v", detail)
+	}
+	w = n.signedRequest(t, a, http.MethodGet, "/api/v1/public/groups/grp_apps/members", nil, "member-list-public-key")
+	if w.Code != 200 {
+		t.Fatalf("member list: %d %s", w.Code, w.Body)
+	}
+	members := decodeMap(t, w)["items"].([]any)
+	keys := map[string]string{}
+	for _, raw := range members {
+		m := raw.(map[string]any)
+		keys[m["device_id"].(string)] = m["public_key"].(string)
+	}
+	if keys[a.id] != base64.RawURLEncoding.EncodeToString(a.pub) || keys[b.id] != base64.RawURLEncoding.EncodeToString(b.pub) {
+		t.Fatalf("member public keys do not match registered identities: %#v", keys)
+	}
+	if w = n.signedRequest(t, a, http.MethodGet, "/api/v1/public/groups/grp_other/applications", nil, "cross-group-application-list"); w.Code != 403 {
+		t.Fatalf("cross-group application list was not forbidden: %d %s", w.Code, w.Body)
+	}
+	if w = n.signedRequest(t, a, http.MethodDelete, "/api/v1/public/groups/grp_apps/members/"+b.id, []byte("{}"), "revoke-for-application-boundary"); w.Code != 202 {
+		t.Fatalf("revoke member: %d %s", w.Code, w.Body)
+	}
+	if w = n.signedRequest(t, b, http.MethodGet, "/api/v1/public/groups/grp_apps/applications", nil, "revoked-application-list"); w.Code != 403 {
+		t.Fatalf("revoked member application list was not forbidden: %d %s", w.Code, w.Body)
 	}
 }
 

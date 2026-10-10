@@ -592,3 +592,120 @@ func assertFileTombstone(t *testing.T, n testNode, fileID, reason string) {
 		t.Fatal(err)
 	}
 }
+
+func TestFileCacheStatsScopedCleanupAndIdempotency(t *testing.T) {
+	n := newTestNode(t)
+	defer n.close(t)
+	target := n.enroll(t)
+	payload := []byte("cache scoped ciphertext")
+	sender, groupAndFile := createTransferFixture(t, n, []string{target.id}, int64(len(payload)), 6, payload, 3600)
+	parts := strings.SplitN(groupAndFile, "/", 2)
+	statsPath := "/api/v1/public/groups/" + parts[0] + "/file-transfers/cache"
+	w := n.signedFileRequest(t, sender, http.MethodGet, statsPath, nil, "cache-stats-uploading-001")
+	if w.Code != 200 {
+		t.Fatalf("uploading stats: %d %s", w.Code, w.Body)
+	}
+	stats := decodeMap(t, w)
+	if stats["group_id"] != parts[0] {
+		t.Fatalf("stats group id: %#v", stats["group_id"])
+	}
+	uploading := stats["uploading"].(map[string]any)
+	if uploading["count"] != float64(1) || uploading["bytes"] != float64(len(payload)) {
+		t.Fatalf("uploading stats: %#v", uploading)
+	}
+	uploadAndComplete(t, n, sender, "cache-scope", groupAndFile, payload, 6)
+	w = n.signedFileRequest(t, sender, http.MethodGet, statsPath, nil, "cache-stats-available-001")
+	if w.Code != 200 {
+		t.Fatalf("available stats: %d %s", w.Code, w.Body)
+	}
+	stats = decodeMap(t, w)
+	available := stats["available"].(map[string]any)
+	if available["count"] != float64(1) || available["bytes"] != float64(len(payload)) {
+		t.Fatalf("available stats: %#v", available)
+	}
+
+	cleanupPath := "/api/v1/public/groups/" + parts[0] + "/file-transfers/cache/cleanup"
+	cleanupBody, _ := json.Marshal(map[string]any{"file_ids": []string{parts[1]}})
+	w = n.signedFileRequest(t, target, http.MethodPost, cleanupPath, cleanupBody, "cache-cleanup-forbidden-001")
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "delete_forbidden") {
+		t.Fatalf("non-sender cleanup should be forbidden: %d %s", w.Code, w.Body)
+	}
+	w = n.signedFileRequest(t, sender, http.MethodPost, cleanupPath, cleanupBody, "cache-cleanup-001")
+	if w.Code != http.StatusOK {
+		t.Fatalf("cleanup: %d %s", w.Code, w.Body)
+	}
+	cleanup := decodeMap(t, w)
+	if cleanup["physical_cleanup_complete"] != true {
+		t.Fatalf("cleanup should remove physical file: %#v", cleanup)
+	}
+	w = n.signedFileRequest(t, sender, http.MethodPost, cleanupPath, cleanupBody, "cache-cleanup-001")
+	if w.Code != http.StatusOK || w.Body.String() != string(mustJSON(t, cleanup))+"\n" {
+		t.Fatalf("cleanup replay: %d %s", w.Code, w.Body)
+	}
+	if err := n.st.View(func(st store.State) error {
+		f := st.Files[parts[1]]
+		if f.Status != "tombstone" || f.TombstoneReason != "deleted_by_member" {
+			t.Fatalf("cleanup did not create tombstone: %#v", f)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(n.s.fileBlobPath(parts[1])); !os.IsNotExist(err) {
+		t.Fatalf("cleanup left blob: %v", err)
+	}
+	w = n.signedFileRequest(t, sender, http.MethodGet, statsPath, nil, "cache-stats-deleted-001")
+	if w.Code != http.StatusOK {
+		t.Fatalf("deleted stats: %d %s", w.Code, w.Body)
+	}
+	stats = decodeMap(t, w)
+	deleted := stats["logical_deleted"].(map[string]any)
+	pending := stats["cleanup_pending"].(map[string]any)
+	if deleted["count"] != float64(1) || pending["count"] != float64(0) {
+		t.Fatalf("deleted stats: %#v pending=%#v", deleted, pending)
+	}
+}
+
+func TestFileCacheCleanupDoesNotTouchOtherGroup(t *testing.T) {
+	n := newTestNode(t)
+	defer n.close(t)
+	firstTarget := n.enroll(t)
+	firstSender, firstGroupFile := createTransferFixture(t, n, []string{firstTarget.id}, 8, 4, []byte("12345678"), 3600)
+	secondTarget := n.enroll(t)
+	secondSender, secondGroupFile := createTransferFixture(t, n, []string{secondTarget.id}, 8, 4, []byte("abcdefgh"), 3600)
+	_ = firstTarget
+	_ = secondTarget
+	uploadAndComplete(t, n, firstSender, "cache-isolation-a", firstGroupFile, []byte("12345678"), 4)
+	uploadAndComplete(t, n, secondSender, "cache-isolation-b", secondGroupFile, []byte("abcdefgh"), 4)
+	firstParts := strings.SplitN(firstGroupFile, "/", 2)
+	secondParts := strings.SplitN(secondGroupFile, "/", 2)
+	path := "/api/v1/public/groups/" + firstParts[0] + "/file-transfers/cache/cleanup"
+	body, _ := json.Marshal(map[string]any{"file_ids": []string{firstParts[1]}})
+	w := n.signedFileRequest(t, firstSender, http.MethodPost, path, body, "cache-isolation-cleanup-001")
+	if w.Code != http.StatusOK {
+		t.Fatalf("group cleanup: %d %s", w.Code, w.Body)
+	}
+	if err := n.st.View(func(st store.State) error {
+		if st.Files[firstParts[1]].Status != "tombstone" {
+			t.Fatal("first group file was not tombstoned")
+		}
+		if st.Files[secondParts[1]].Status != "available" {
+			t.Fatal("other group file was changed")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(n.s.fileBlobPath(secondParts[1])); err != nil {
+		t.Fatalf("other group blob was removed: %v", err)
+	}
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	b, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}

@@ -45,6 +45,8 @@ type Server struct {
 	challenges     map[string]challenge
 	challengeRates map[string]challengeRate
 	commandMu      sync.Mutex
+	presenceMu     sync.Mutex
+	presence       map[string]presenceRecord
 }
 
 type challenge struct {
@@ -76,7 +78,7 @@ func New(config Config, configPath string, st *store.Store) (*Server, error) {
 		return nil, err
 	}
 	h := sha256.Sum256(token)
-	return &Server{store: st, config: config, configPath: configPath, tokenHash: h, startedAt: time.Now().UTC(), publicAddr: config.PublicListen, adminAddr: config.AdminListen, challenges: map[string]challenge{}, challengeRates: map[string]challengeRate{}}, nil
+	return &Server{store: st, config: config, configPath: configPath, tokenHash: h, startedAt: time.Now().UTC(), publicAddr: config.PublicListen, adminAddr: config.AdminListen, challenges: map[string]challenge{}, challengeRates: map[string]challengeRate{}, presence: map[string]presenceRecord{}}, nil
 }
 
 func (s *Server) configSnapshot() Config {
@@ -99,10 +101,12 @@ func (s *Server) PublicHandler() http.Handler {
 	mux.HandleFunc("GET /api/v1/public/node", s.publicNodeInfo)
 	mux.HandleFunc("POST /api/v1/public/devices/challenge", s.deviceChallenge)
 	mux.HandleFunc("POST /api/v1/public/devices/enroll", s.deviceEnroll)
+	mux.HandleFunc("POST /api/v1/public/devices/heartbeat", s.deviceHeartbeat)
 	mux.HandleFunc("POST /api/v1/public/groups", s.createGroup)
 	mux.HandleFunc("POST /api/v1/public/groups/{group}/invites", s.createInvite)
 	mux.HandleFunc("GET /api/v1/public/invites/{code}", s.inviteInfo)
 	mux.HandleFunc("POST /api/v1/public/invites/{code}/applications", s.applyInvite)
+	mux.HandleFunc("GET /api/v1/public/groups/{group}/applications", s.applicationList)
 	mux.HandleFunc("GET /api/v1/public/groups/{group}/applications/{application}", s.applicationStatus)
 	mux.HandleFunc("POST /api/v1/public/groups/{group}/applications/{application}/approvals", s.approveApplication)
 	mux.HandleFunc("POST /api/v1/public/groups/{group}/applications/{application}/key-delivery", s.deliverJoinKey)
@@ -112,6 +116,7 @@ func (s *Server) PublicHandler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/public/groups/{group}/members/{member}", s.revokeMember)
 	mux.HandleFunc("POST /api/v1/public/groups/{group}/creator", s.transferCreator)
 	mux.HandleFunc("GET /api/v1/public/groups/{group}/members", s.memberList)
+	mux.HandleFunc("GET /api/v1/public/groups/{group}/presence", s.groupPresence)
 	mux.HandleFunc("POST /api/v1/public/groups/{group}/rotations/{event}", s.completeRotation)
 	mux.HandleFunc("GET /api/v1/public/groups/{group}/key-deliveries", s.keyDeliveries)
 	mux.HandleFunc("POST /api/v1/public/groups/{group}/key-deliveries/{delivery}/ack", s.ackKeyDelivery)
@@ -222,7 +227,7 @@ func (s *Server) putAdminConfig(w http.ResponseWriter, r *http.Request) {
 	if restartRequired(oldConfig, c) {
 		// These fields are durable and visible now; listener/store/token changes
 		// require a process restart to take effect in this single-process slice.
-		response = map[string]any{"schema_version": c.SchemaVersion, "public_listen": c.PublicListen, "admin_listen": c.AdminListen, "data_dir": c.DataDir, "admin_token_file": c.AdminTokenFile, "max_storage_bytes": c.MaxStorageBytes, "allow_insecure_loopback": c.AllowInsecureLoopback, "peer_relay_enabled": c.PeerRelayEnabled, "file_storage_enabled": c.FileStorageEnabled, "group_quota_bytes": c.GroupQuotaBytes, "quota_bytes_per_member": c.QuotaBytesPerMember, "max_file_bytes": c.MaxFileBytes, "max_file_ttl_seconds": c.MaxFileTTLSeconds, "restart_required": true}
+		response = map[string]any{"schema_version": c.SchemaVersion, "public_listen": c.PublicListen, "admin_listen": c.AdminListen, "data_dir": c.DataDir, "admin_token_file": c.AdminTokenFile, "max_storage_bytes": c.MaxStorageBytes, "allow_insecure_loopback": c.AllowInsecureLoopback, "peer_relay_enabled": c.PeerRelayEnabled, "file_storage_enabled": c.FileStorageEnabled, "group_quota_bytes": c.GroupQuotaBytes, "quota_bytes_per_member": c.QuotaBytesPerMember, "max_file_bytes": c.MaxFileBytes, "max_file_ttl_seconds": c.MaxFileTTLSeconds, "heartbeat_interval_seconds": c.HeartbeatIntervalSeconds, "heartbeat_timeout_seconds": c.HeartbeatTimeoutSeconds, "restart_required": true}
 	}
 	encoded, _ := json.Marshal(response)
 	if err := s.rememberAdminIdempotency(key, "admin.config.put", b, 200, encoded); err != nil {

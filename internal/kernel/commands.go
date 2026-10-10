@@ -194,7 +194,7 @@ func (s *Server) commandCandidates(words []string, prefix string) []completionCa
 	return values
 }
 
-var configFieldNames = []string{"public_listen", "admin_listen", "data_dir", "admin_token_file", "max_storage_bytes", "allow_insecure_loopback", "peer_relay_enabled", "file_storage_enabled", "group_quota_bytes", "quota_bytes_per_member", "max_file_bytes", "max_file_ttl_seconds"}
+var configFieldNames = []string{"public_listen", "admin_listen", "data_dir", "admin_token_file", "max_storage_bytes", "allow_insecure_loopback", "peer_relay_enabled", "file_storage_enabled", "group_quota_bytes", "quota_bytes_per_member", "max_file_bytes", "max_file_ttl_seconds", "heartbeat_interval_seconds", "heartbeat_timeout_seconds"}
 
 // checkAdminIdempotency is called while commandMu is held. It returns ok=false
 // after writing an error; replayed=true means the original response was sent.
@@ -586,7 +586,7 @@ func setConfigField(c *Config, key string, raw json.RawMessage) error {
 		case "admin_token_file":
 			c.AdminTokenFile = v
 		}
-	case "max_storage_bytes", "group_quota_bytes", "quota_bytes_per_member", "max_file_bytes", "max_file_ttl_seconds":
+	case "max_storage_bytes", "group_quota_bytes", "quota_bytes_per_member", "max_file_bytes", "max_file_ttl_seconds", "heartbeat_interval_seconds", "heartbeat_timeout_seconds":
 		var v int64
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return fail(400, "invalid_flag", key+" must be an integer")
@@ -602,6 +602,10 @@ func setConfigField(c *Config, key string, raw json.RawMessage) error {
 			c.MaxFileBytes = v
 		case "max_file_ttl_seconds":
 			c.MaxFileTTLSeconds = v
+		case "heartbeat_interval_seconds":
+			c.HeartbeatIntervalSeconds = v
+		case "heartbeat_timeout_seconds":
+			c.HeartbeatTimeoutSeconds = v
 		}
 	case "file_storage_enabled":
 		if err := json.Unmarshal(raw, &c.FileStorageEnabled); err != nil {
@@ -635,7 +639,7 @@ func restartRequired(old, next Config) bool {
 }
 
 func configRestartResponse(c Config) map[string]any {
-	return map[string]any{"schema_version": c.SchemaVersion, "public_listen": c.PublicListen, "admin_listen": c.AdminListen, "data_dir": c.DataDir, "admin_token_file": c.AdminTokenFile, "max_storage_bytes": c.MaxStorageBytes, "allow_insecure_loopback": c.AllowInsecureLoopback, "peer_relay_enabled": c.PeerRelayEnabled, "file_storage_enabled": c.FileStorageEnabled, "group_quota_bytes": c.GroupQuotaBytes, "quota_bytes_per_member": c.QuotaBytesPerMember, "max_file_bytes": c.MaxFileBytes, "max_file_ttl_seconds": c.MaxFileTTLSeconds, "restart_required": true}
+	return map[string]any{"schema_version": c.SchemaVersion, "public_listen": c.PublicListen, "admin_listen": c.AdminListen, "data_dir": c.DataDir, "admin_token_file": c.AdminTokenFile, "max_storage_bytes": c.MaxStorageBytes, "allow_insecure_loopback": c.AllowInsecureLoopback, "peer_relay_enabled": c.PeerRelayEnabled, "file_storage_enabled": c.FileStorageEnabled, "group_quota_bytes": c.GroupQuotaBytes, "quota_bytes_per_member": c.QuotaBytesPerMember, "max_file_bytes": c.MaxFileBytes, "max_file_ttl_seconds": c.MaxFileTTLSeconds, "heartbeat_interval_seconds": c.HeartbeatIntervalSeconds, "heartbeat_timeout_seconds": c.HeartbeatTimeoutSeconds, "restart_required": true}
 }
 
 func (s *Server) persistConfig(c Config) error {

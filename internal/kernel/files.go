@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ const (
 	maxFileChunkBytes     = int64(4 << 20)
 	defaultFileTTL        = 7 * 24 * time.Hour
 	maxFileTTL            = 365 * 24 * time.Hour
+	maxFileCleanupBatch   = 100
 )
 
 var fileRootLocks sync.Map // absolute data directory -> *sync.Mutex
@@ -49,6 +51,24 @@ type FileStorageStats struct {
 	Evictions      int   `json:"evictions"`
 }
 
+type fileCacheBucket struct {
+	Count int   `json:"count"`
+	Bytes int64 `json:"bytes"`
+}
+
+type fileCacheStats struct {
+	GroupID        string          `json:"group_id"`
+	Uploading      fileCacheBucket `json:"uploading"`
+	Available      fileCacheBucket `json:"available"`
+	CleanupPending fileCacheBucket `json:"cleanup_pending"`
+	LogicalDeleted fileCacheBucket `json:"logical_deleted"`
+	PhysicalBytes  int64           `json:"physical_bytes"`
+}
+
+type fileCacheCleanupRequest struct {
+	FileIDs []string `json:"file_ids"`
+}
+
 // FileHandler returns the authenticated resumable-transfer API as a standalone
 // handler. PublicHandler can mount the same routes by calling registerFileRoutes.
 func (s *Server) FileHandler() http.Handler {
@@ -67,6 +87,8 @@ func (s *Server) registerFileRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/v1/public/groups/{group}/files/{file}", s.legacyInlineFilesRemoved)
 	mux.HandleFunc("POST /api/v1/public/groups/{group}/file-transfers", s.createFileTransfer)
 	mux.HandleFunc("GET /api/v1/public/groups/{group}/file-transfers", s.listFileTransfers)
+	mux.HandleFunc("GET /api/v1/public/groups/{group}/file-transfers/cache", s.fileCacheStatsHandler)
+	mux.HandleFunc("POST /api/v1/public/groups/{group}/file-transfers/cache/cleanup", s.cleanupFileCache)
 	mux.HandleFunc("PUT /api/v1/public/groups/{group}/file-transfers/{file}/chunks/{index}", s.putFileChunk)
 	mux.HandleFunc("GET /api/v1/public/groups/{group}/file-transfers/{file}/chunks/{index}", s.getFileChunk)
 	mux.HandleFunc("POST /api/v1/public/groups/{group}/file-transfers/{file}/complete", s.completeFileTransfer)
@@ -863,6 +885,240 @@ func (s *Server) listFileTransfers(w http.ResponseWriter, r *http.Request) {
 		next = 0
 	}
 	writeJSON(w, 200, map[string]any{"items": page, "next_offset": next})
+}
+
+// fileCacheStatsHandler reports the logical transfer state and the physical
+// cache state for one group. It deliberately does not run the global janitor:
+// a group-scoped read must not remove another group's files.
+func (s *Server) fileCacheStatsHandler(w http.ResponseWriter, r *http.Request) {
+	device, _, ok := s.authorizedBody(w, r)
+	if !ok {
+		return
+	}
+	if !s.requireFileStorage(w, r) {
+		return
+	}
+	group := r.PathValue("group")
+	s.fileLock().Lock()
+	defer s.fileLock().Unlock()
+	stats := fileCacheStats{GroupID: group}
+	err := s.store.View(func(st store.State) error {
+		g, ok := st.Groups[group]
+		if !ok {
+			return fail(404, "group_not_found", "group not found")
+		}
+		member, ok := g.Members[device]
+		if !ok || !member.Active {
+			return fail(403, "membership_required", "active group membership is required")
+		}
+		for _, f := range st.Files {
+			if f.GroupID != group || f.ChunkCount == 0 {
+				continue
+			}
+			physicalBytes := s.filePhysicalBytes(f.ID)
+			stats.PhysicalBytes += physicalBytes
+			status := f.Status
+			if status == "" {
+				status = "available"
+			}
+			switch status {
+			case "uploading":
+				stats.Uploading.Count++
+				stats.Uploading.Bytes += f.SizeBytes
+			case "available":
+				stats.Available.Count++
+				stats.Available.Bytes += f.SizeBytes
+			case "tombstone":
+				stats.LogicalDeleted.Count++
+				stats.LogicalDeleted.Bytes += f.SizeBytes
+				if physicalBytes > 0 {
+					stats.CleanupPending.Count++
+					stats.CleanupPending.Bytes += physicalBytes
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		status, code, msg := httpError(err)
+		writeError(w, r, status, code, msg)
+		return
+	}
+	writeJSON(w, 200, stats)
+}
+
+func (s *Server) cleanupFileCache(w http.ResponseWriter, r *http.Request) {
+	device, body, ok := s.authorizedBody(w, r)
+	if !ok {
+		return
+	}
+	if !s.requireFileStorage(w, r) {
+		return
+	}
+	var req fileCacheCleanupRequest
+	if err := decodeJSON(body, &req); err != nil || len(req.FileIDs) == 0 {
+		writeError(w, r, 400, "invalid_cleanup_request", "file_ids must contain at least one file id")
+		return
+	}
+	if len(req.FileIDs) > maxFileCleanupBatch {
+		writeError(w, r, 400, "cleanup_batch_too_large", fmt.Sprintf("file_ids may contain at most %d entries", maxFileCleanupBatch))
+		return
+	}
+	seen := make(map[string]bool, len(req.FileIDs))
+	for _, id := range req.FileIDs {
+		if id == "" || seen[id] {
+			writeError(w, r, 400, "invalid_cleanup_request", "file_ids must contain distinct non-empty ids")
+			return
+		}
+		seen[id] = true
+	}
+	group := r.PathValue("group")
+	s.fileLock().Lock()
+	defer s.fileLock().Unlock()
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if len(key) < 8 || len(key) > 128 {
+		writeError(w, r, 400, "idempotency_key_required", "Idempotency-Key must contain 8 to 128 characters")
+		return
+	}
+	storageKey := idempotencyKey(device, "file_cache.cleanup:"+group, key)
+	hash := fingerprint("file_cache.cleanup:"+group, body)
+	var replay store.Idempotent
+	replayed := false
+	if err := s.store.View(func(st store.State) error {
+		if old, ok := st.Idempotency[storageKey]; ok {
+			if old.Fingerprint != hash {
+				return errIdempotencyConflict
+			}
+			replay = old
+			replayed = true
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, errIdempotencyConflict) {
+			writeError(w, r, 409, "idempotency_conflict", "Idempotency-Key was already used with a different request")
+		} else {
+			writeError(w, r, 500, "storage_unavailable", "could not read durable state")
+		}
+		return
+	}
+	if replayed {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(replay.Status)
+		_, _ = w.Write(append(append([]byte(nil), replay.Body...), '\n'))
+		return
+	}
+	var deleted, already []string
+	err := s.store.Update(func(st *store.State) error {
+		g, ok := st.Groups[group]
+		if !ok {
+			return fail(404, "group_not_found", "group not found")
+		}
+		member, ok := g.Members[device]
+		if !ok || !member.Active {
+			return fail(403, "membership_required", "active group membership is required")
+		}
+		for _, id := range req.FileIDs {
+			f, ok := st.Files[id]
+			if !ok || f.GroupID != group || f.ChunkCount == 0 {
+				return fail(404, "file_not_found", "file transfer not found")
+			}
+			if f.SenderID != device && member.Role != "creator" && member.Role != "admin" {
+				return fail(403, "delete_forbidden", "only the sender or group administrator may delete this file")
+			}
+		}
+		for _, id := range req.FileIDs {
+			f := st.Files[id]
+			if f.Status == "tombstone" {
+				already = append(already, id)
+				continue
+			}
+			f.Status = "tombstone"
+			f.TombstoneReason = "deleted_by_member"
+			st.Files[id] = f
+			deleted = append(deleted, id)
+		}
+		return nil
+	})
+	if err != nil {
+		status, code, msg := httpError(err)
+		writeError(w, r, status, code, msg)
+		return
+	}
+	// The metadata transition is durable before physical removal begins. The
+	// targeted cleanup preserves files belonging to every other group.
+	s.cleanupSelectedFileArtifacts(req.FileIDs)
+	pending := make([]string, 0)
+	for _, id := range req.FileIDs {
+		if s.filePhysicalBytes(id) > 0 {
+			pending = append(pending, id)
+		}
+	}
+	responseValue := map[string]any{
+		"group_id":                  group,
+		"requested":                 len(req.FileIDs),
+		"logical_deleted":           deleted,
+		"already_deleted":           already,
+		"cleanup_pending":           pending,
+		"physical_cleanup_complete": len(pending) == 0,
+	}
+	response, err := json.Marshal(responseValue)
+	if err != nil {
+		writeError(w, r, 500, "internal_error", "could not encode cleanup response")
+		return
+	}
+	if err := s.store.Update(func(st *store.State) error {
+		if old, ok := st.Idempotency[storageKey]; ok {
+			if old.Fingerprint != hash {
+				return errIdempotencyConflict
+			}
+			return nil
+		}
+		st.Idempotency[storageKey] = store.Idempotent{Fingerprint: hash, Status: 200, Body: response}
+		return nil
+	}); err != nil {
+		if errors.Is(err, errIdempotencyConflict) {
+			writeError(w, r, 409, "idempotency_conflict", "Idempotency-Key was already used with a different request")
+		} else {
+			writeError(w, r, 500, "storage_unavailable", "cleanup committed but idempotency result could not be recorded")
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(200)
+	_, _ = w.Write(append(response, '\n'))
+}
+
+func (s *Server) filePhysicalBytes(id string) int64 {
+	var total int64
+	add := func(path string) {
+		info, err := os.Stat(path)
+		if err != nil {
+			return
+		}
+		if !info.IsDir() {
+			total += info.Size()
+			return
+		}
+		_ = filepath.WalkDir(path, func(path string, entry os.DirEntry, err error) error {
+			if err != nil || entry.IsDir() {
+				return nil
+			}
+			if info, err := entry.Info(); err == nil {
+				total += info.Size()
+			}
+			return nil
+		})
+	}
+	add(s.fileBlobPath(id))
+	add(filepath.Join(s.fileRoot(), "uploads", id))
+	return total
+}
+
+func (s *Server) cleanupSelectedFileArtifacts(ids []string) {
+	for _, id := range ids {
+		_ = os.Remove(s.fileBlobPath(id))
+		_ = os.RemoveAll(filepath.Join(s.fileRoot(), "uploads", id))
+	}
 }
 
 func (s *Server) deleteFileTransfer(w http.ResponseWriter, r *http.Request) {

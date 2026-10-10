@@ -147,19 +147,22 @@ Authorization: Bearer <admin-token>
 | `POST /groups/{group}/invites` | 空 body 或 `{}` | `201`：`invite_code`、`group_id`、`expires_at`。任何活跃成员都可创建邀请。 |
 | `GET /invites/{code}` | 公开，无 body | `200`：`group_id`、`group_name`、`authority_node`、`member_count`、`approval_policy`、`expires_at`。仅返回展示信息。 |
 | `POST /invites/{code}/applications` | 空 body 或 `{}` | `201`：`application_id`、`group_id`、`status`、`required_approvals`。邀请必须尚未过期/撤销，设备不能已是活跃成员。 |
-| `GET /groups/{group}/applications/{application}` | 无 body | `200`：`application_id`、`device_id`、`status`、`approvals`、`updated_at`。申请人本人或群组活跃成员可查看。 |
+| `GET /groups/{group}/applications` | query 可选 `status`、`cursor`、`limit` | `200`：`items`、`next_cursor`。仅群组活跃成员可读取；默认只返回 `pending_approval`、`awaiting_key`，排序为 `created_at` 升序再按 `application_id` 升序。 |
+| `GET /groups/{group}/applications/{application}` | 无 body | `200`：`application_id`、`device_id`、`public_key`、`status`、`approvals`、`created_at`、`updated_at`。申请人本人或群组活跃成员可查看。 |
 | `POST /groups/{group}/applications/{application}/approvals` | `{"approve":true}` 或 `false` | `200`：`application_id`、`status`、`approvals`。活跃成员须为此申请的审批人；群组 admin 可代行一个尚未处理的审批槽。拒绝后为 `rejected`，全部批准后为 `awaiting_key`。 |
 | `POST /groups/{group}/applications/{application}/key-delivery` | `{"envelope":"<opaque base64url>"}` | `201`：`application_id`、`status:"approved"`、`member_device_id`、`generation`。任何活跃成员可在申请为 `awaiting_key` 时提交加密信封；成员加入和信封入队原子提交。 |
 
 `approval_policy` 可选 `all`、`creator`、`inviter`、`creator_inviter` 或 `public`。`public` 申请跳过审批并进入 `awaiting_key`；其他策略依据邀请时对应的活跃成员产生审批槽。申请状态常见值为 `pending_approval`、`awaiting_key`、`approved`、`rejected`。
 
-信封是 opaque payload；服务端只存储和转交，不能解密内容密钥。加入设备通过 `GET /groups/{group}/key-deliveries` 获取未确认的密钥投递，见 4.4。
+申请列表的 `limit` 默认 100、最大 200；`status` 可重复或使用逗号分隔，支持上述四种状态和 `all`。`cursor` 是服务端返回的不透明无填充 base64url 游标，客户端不得自行构造或解析；空 `next_cursor` 表示没有下一页。列表和详情中的 `public_key` 始终从已登记设备身份读取，并与 `device_id` 一致。
+
+信封是 opaque payload；服务端只存储和转交，不能解密内容密钥。加入设备通过 `GET /groups/{group}/key-deliveries` 获取未确认的密钥投递，见 4.5。
 
 ### 4.3 群组、成员、离开和轮换
 
 | 方法和路径 | 请求体 / query | 成功响应与权限 |
 |---|---|---|
-| `GET /groups/{group}/members` | 无 body | `200`：`{"items":[Member...]}`。仅活跃成员可读取；Member 字段为 `device_id`、`role`、`active`、`joined_at`。 |
+| `GET /groups/{group}/members` | 无 body | `200`：`{"items":[Member...]}`。仅活跃成员可读取；Member 字段为 `device_id`、`public_key`、`role`、`active`、`joined_at`。 |
 | `PUT /groups/{group}/members/{member}/role` | `{"role":"admin"}` 或 `{"role":"member"}` | `200`：`group_id`、`device_id`、`role`。仅 creator 可调整其他活跃成员的角色；creator 角色必须通过下方转让接口转移。 |
 | `DELETE /groups/{group}/members/{member}` | 空 body 或 `{}` | `202`：`group_id`、`device_id`、`status:"revoked"`、`control_event_id`、`required_generation`。Creator 可撤销任一非 creator 成员（包括 admin）；admin 只能撤销普通成员。被撤销的成员立即失去群组访问权。 |
 | `POST /groups/{group}/creator` | `{"new_creator_id":"dev_..."}` | `200`：`group_id`、`creator_id`。仅当前 creator 可将角色转给一个活跃成员；原 creator 转成普通 member。 |
@@ -178,7 +181,16 @@ Authorization: Bearer <admin-token>
 
 成员离开或被撤销会创建持久的控制事件和递增的 required generation。剩余成员先读取事件，再由任一活跃成员为除自己以外的每个活跃成员提供且仅提供一个新密钥信封。轮换必须按事件顺序完成，`epoch` 必须等于事件的 `required_epoch` 且大于当前 generation。存在未完成轮换时，消息和文件发布返回 `409 rotation_required`；旧 epoch 内容返回 `409 generation_mismatch`。
 
-### 4.4 密钥投递
+### 4.4 设备心跳与小组在线状态
+
+| 方法和路径 | 请求体 | 成功响应与权限 |
+|---|---|---|
+| `POST /devices/heartbeat` | `{}` 或 `{"client_version":"launcher/1.0"}` | `200`：`device_id`、`online:true`、服务端生成的 `last_seen_at`、`expires_at`，以及可选 `client_version`。需要设备签名，不要求幂等 key。 |
+| `GET /groups/{group}/presence` | 无 body | `200`：`{"items":[...]}`。仅当前小组活跃成员可读，按 `device_id` 稳定排序。 |
+
+心跳时间由服务端接收时间决定，客户端不能提交或覆盖 `online`。presence 默认超时为 90 秒，心跳建议间隔为 30 秒；可通过 `heartbeat_interval_seconds` 和 `heartbeat_timeout_seconds` 配置，0 使用默认值。`client_version` 最多 64 字节且不得包含换行。返回项包含 `device_id`、`online`、`last_seen_at`，有版本时还包含 `client_version`；从未心跳的成员 `online:false` 且 `last_seen_at` 为空。在线状态只保存在进程内内存，服务重启后所有成员先报告离线，不从历史快照恢复。单进程最多保留 100,000 个设备记录，过期记录会在心跳时清理。成员离开或被撤销后立即失去 presence 读取权限，并从其小组结果中消失。
+
+### 4.5 密钥投递
 
 | 方法和路径 | 请求体 | 成功响应与说明 |
 |---|---|---|
@@ -187,7 +199,7 @@ Authorization: Bearer <admin-token>
 
 KeyDelivery 对象包含 `id`、`group_id`、`sender_id`、`recipient_id`、`epoch`、`envelope`、`created_at`、`acknowledged`。确认后再次读取未确认列表时不会再出现该项。
 
-### 4.5 群组消息
+### 4.6 群组消息
 
 | 方法和路径 | 请求体 / query | 成功响应 |
 |---|---|---|
@@ -196,7 +208,7 @@ KeyDelivery 对象包含 `id`、`group_id`、`sender_id`、`recipient_id`、`epo
 
 两个接口仅活跃成员可用。消息 ciphertext 必须是非空、无 `=` padding 的 base64url。`epoch` 必须严格匹配当前 generation。`after` 是无符号序号；`limit` 默认 100、最大 200。消息列表对格式错误或小于 1 的 limit 使用默认值，对大于最大值的 limit 截为最大值；`next_cursor` 是十进制字符串。
 
-### 4.6 文件传输
+### 4.7 文件传输
 
 文件 API 的逐步上传、断点续传、配额、TTL、校验、tombstone 和响应示例见 [FILE-TRANSFER.md](FILE-TRANSFER.md)。接口清单：
 
@@ -207,10 +219,14 @@ KeyDelivery 对象包含 `id`、`group_id`、`sender_id`、`recipient_id`、`epo
 | `GET /groups/{group}/file-transfers/{file}/chunks/{index}` | 下载 raw ciphertext chunk；响应头 `X-Chunk-SHA256` 给出该块摘要。 |
 | `POST /groups/{group}/file-transfers/{file}/complete` | 校验所有块和整体 SHA-256 并完成上传；空 body 或 `{}`。 |
 | `GET /groups/{group}/file-transfers` | 按 `offset`/`limit` 分页列出上传、已完成及 tombstone 元数据。 |
+| `GET /groups/{group}/file-transfers/cache` | 返回当前小组 transfer 缓存的 `uploading`、`available`、`cleanup_pending`、`logical_deleted` 统计，不触碰其他小组。 |
+| `POST /groups/{group}/file-transfers/cache/cleanup` | `{"file_ids":["ft_..."]}` 批量逻辑删除当前小组文件缓存；最多 100 个 ID，需要幂等 key。 |
 | `POST /groups/{group}/file-transfers/{file}/ack` | 接收目标确认下载；空 body 或 `{}`。 |
 | `DELETE /groups/{group}/file-transfers/{file}` | 发送者、creator 或 admin 删除传输。 |
 
 上传/完成/确认/删除和块上传都是设备签名的写请求，均需要幂等 key。文件块请求签名时直接对原始 ciphertext 字节计算 SHA-256。文件存储必须启用；若关闭则文件 API 返回 `403 file_storage_disabled`。旧 `POST|GET /groups/{group}/files` 和 `DELETE /groups/{group}/files/{file}` inline API 已退役，返回 `410 file_transfer_required`；客户端应迁移到分块 API。
+
+缓存统计每个桶包含 `count` 和逻辑 `bytes`，另外返回 `physical_bytes`。`cleanup_pending` 表示已有 tombstone 但磁盘 blob 或上传目录仍存在，`logical_deleted` 表示逻辑删除记录总数。清理成功响应包含 `group_id`、`requested`、`logical_deleted`、`already_deleted`、`cleanup_pending` 和 `physical_cleanup_complete`；逻辑状态先提交，物理删除失败时会保留 tombstone 并报告待清理文件。普通成员只能清理自己发送的 transfer，creator/admin 可清理本组 transfer；请求中的任何文件 ID 跨组、未知或不属于当前小组时整批失败。该接口不会清理其他小组、成员关系、设备身份、密钥投递或控制事件。
 
 ## 5. 管理 API
 
@@ -241,6 +257,7 @@ KeyDelivery 对象包含 `id`、`group_id`、`sender_id`、`recipient_id`、`epo
 | `allow_insecure_loopback`、`peer_relay_enabled`、`file_storage_enabled` | boolean | loopback 明文开发模式、peer relay 开关、文件存储开关。Peer relay 当前未实现；开关为 true 时 status 会报告 `not_implemented`。 |
 | `group_quota_bytes`、`quota_bytes_per_member` | integer | 群组配额，或按活跃成员数计算的配额；大于 0 的 per-member 值优先。 |
 | `max_file_bytes`、`max_file_ttl_seconds` | integer | 单文件大小和最长保留时间上限。 |
+| `heartbeat_interval_seconds`、`heartbeat_timeout_seconds` | integer | 客户端建议心跳间隔和在线超时；默认分别为 30 和 90，0 使用默认值。超时不得小于间隔，且分别不超过 86400 和 604800。 |
 
 管理配置 PUT 使用严格 JSON 解码但会先以当前构建的默认配置填充未提供字段，因此发送配置更新时应始终带上 GET 返回的完整字段，避免静默恢复其他设置的默认值。管理命令的完整注册表、类型、权限标签、示例和本地命令限制见 [ADMIN-COMMANDS.md](ADMIN-COMMANDS.md)。Token create/rotate 是本地 CLI 操作，执行 API 不会生成或传回 token。
 
@@ -256,8 +273,8 @@ KeyDelivery 对象包含 `id`、`group_id`、`sender_id`、`recipient_id`、`epo
 
 ## 7. 当前实现与验证边界
 
-此 API 版本已实现单节点设备注册、群组邀请与审批、成员角色/撤销、持久事件、轮换信封、opaque 消息中继和可续传加密文件存储。以下能力未实现：WebSocket、多节点 federation/复制/转发、跨节点邀请发现、数据库后端、群组审计日志、生产 TLS 证书管理和 peer relay。状态字段遇到未实现能力时会返回 `not_supported` 或 `not_implemented`，客户端不应假定它可用。
+此 API 版本已实现单节点设备注册、群组邀请与审批、待处理申请列表、公钥读取、成员角色/撤销、设备心跳与小组 presence、持久事件、轮换信封、opaque 消息中继、可续传加密文件存储和按小组缓存清理。在线状态只存在内存，重启后从离线开始；缓存清理只写入文件 tombstone 并清理指定小组的 blob/上传临时目录，不影响控制事件、成员关系、设备身份或密钥投递。以下能力未实现：WebSocket、多节点 federation/复制/转发、跨节点邀请发现、数据库后端、群组审计日志、生产 TLS 证书管理和 peer relay。状态字段遇到未实现能力时会返回 `not_supported` 或 `not_implemented`，客户端不应假定它可用。
 
-当前自动化 API 测试使用进程内 `httptest` 服务端：覆盖了设备注册、群组入群/消息/离开/重启/轮换的主流程、挑战限流和签名 nonce 重放、管理认证/配置校验/命令 API，以及文件上传续传/下载/确认/配额/TTL/tombstone。它们验证服务端处理器和持久化行为，不等于对生产部署逐路由的线上验证。仍缺少直接 HTTP 路由测试的接口包括：邀请创建/查询、申请状态、事件 long-poll、角色更新、成员列表、密钥投递列表/确认、消息列表、文件 transfer 列表/删除，以及管理端群组/存储查询、shutdown、成功的 REST 配置更新。服务器上的人工检查目前确认过管理端 `GET /status`；公开设备、群组、消息及文件全流程尚未在部署服务器完成端到端联调。
+当前自动化 API 测试使用进程内 `httptest` 服务端：覆盖了设备注册、群组入群/消息/离开/重启/轮换的主流程、申请列表和公钥边界、心跳过期/重启/撤销权限、挑战限流和签名 nonce 重放、管理认证/配置校验/命令 API，以及文件上传续传/下载/确认/配额/TTL/tombstone/按组缓存清理。它们验证服务端处理器和持久化行为，不等于对生产部署逐路由的线上验证。仍缺少直接 HTTP 路由测试的接口包括：邀请创建/查询、申请状态、事件 long-poll、角色更新、成员列表、密钥投递列表/确认、消息列表，以及管理端群组/存储查询、shutdown、成功的 REST 配置更新。服务器上的人工检查目前确认过管理端 `GET /status`；公开设备、群组、消息及文件全流程尚未在部署服务器完成端到端联调。
 
 路由注册和数据结构以 `internal/kernel/server.go`、`internal/kernel/public.go`、`internal/kernel/files.go`、`internal/kernel/commands.go` 和 `internal/store/store.go` 为实现依据。专题说明：[CLIENT-PROTOCOL.md](CLIENT-PROTOCOL.md)、[FILE-TRANSFER.md](FILE-TRANSFER.md)、[ADMIN-COMMANDS.md](ADMIN-COMMANDS.md)。
