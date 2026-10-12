@@ -35,18 +35,20 @@ type Store struct {
 }
 
 type State struct {
-	Version       int                      `json:"version"`
-	NodeID        string                   `json:"node_id"`
-	ServerCode    string                   `json:"server_code"`
-	DeviceNonces  map[string]int64         `json:"device_nonces"`
-	Devices       map[string]Device        `json:"devices"`
-	Groups        map[string]Group         `json:"groups"`
-	Invites       map[string]Invite        `json:"invites"`
-	Applications  map[string]Application   `json:"applications"`
-	Idempotency   map[string]Idempotent    `json:"idempotency"`
-	Messages      map[string][]Message     `json:"messages"`
-	KeyDeliveries map[string][]KeyDelivery `json:"key_deliveries"`
-	Files         map[string]File          `json:"files"`
+	Version             int                                      `json:"version"`
+	NodeID              string                                   `json:"node_id"`
+	ServerCode          string                                   `json:"server_code"`
+	DeviceNonces        map[string]int64                         `json:"device_nonces"`
+	Devices             map[string]Device                        `json:"devices"`
+	Groups              map[string]Group                         `json:"groups"`
+	PairingTerminals    map[string]PairingTerminal               `json:"pairing_terminals"`
+	MembershipTerminals map[string]map[string]MembershipTerminal `json:"membership_terminals"`
+	Invites             map[string]Invite                        `json:"invites"`
+	Applications        map[string]Application                   `json:"applications"`
+	Idempotency         map[string]Idempotent                    `json:"idempotency"`
+	Messages            map[string][]Message                     `json:"messages"`
+	KeyDeliveries       map[string][]KeyDelivery                 `json:"key_deliveries"`
+	Files               map[string]File                          `json:"files"`
 }
 
 type Device struct {
@@ -54,6 +56,22 @@ type Device struct {
 	PublicKey  string `json:"public_key"`
 	DeviceName string `json:"device_name,omitempty"`
 	CreatedAt  string `json:"created_at"`
+}
+
+// PairingTerminal records only who may observe a permanently closed pair.
+// It contains no group content, keys, applications, or active memberships.
+type PairingTerminal struct {
+	GroupID   string   `json:"group_id"`
+	DeviceIDs []string `json:"device_ids"`
+	ClosedAt  string   `json:"closed_at"`
+}
+
+// MembershipTerminal is a scoped receipt, never an authorization to content.
+// Role records the exit-time role solely for creator close-result recovery.
+type MembershipTerminal struct {
+	Status string `json:"status"`
+	At     string `json:"at"`
+	Role   string `json:"role"`
 }
 
 type Group struct {
@@ -71,10 +89,11 @@ type Group struct {
 }
 
 type Member struct {
-	DeviceID string `json:"device_id"`
-	Role     string `json:"role"`
-	Active   bool   `json:"active"`
-	JoinedAt string `json:"joined_at"`
+	DeviceID      string `json:"device_id"`
+	Role          string `json:"role"`
+	Active        bool   `json:"active"`
+	JoinedAt      string `json:"joined_at"`
+	KeyDeliveryID string `json:"key_delivery_id,omitempty"`
 }
 
 type Invite struct {
@@ -88,14 +107,15 @@ type Invite struct {
 }
 
 type Application struct {
-	ID         string          `json:"id"`
-	InviteCode string          `json:"invite_code"`
-	GroupID    string          `json:"group_id"`
-	DeviceID   string          `json:"device_id"`
-	Status     string          `json:"status"`
-	Approvals  map[string]bool `json:"approvals"`
-	CreatedAt  string          `json:"created_at"`
-	UpdatedAt  string          `json:"updated_at"`
+	ID            string          `json:"id"`
+	InviteCode    string          `json:"invite_code"`
+	GroupID       string          `json:"group_id"`
+	DeviceID      string          `json:"device_id"`
+	Status        string          `json:"status"`
+	Approvals     map[string]bool `json:"approvals"`
+	CreatedAt     string          `json:"created_at"`
+	UpdatedAt     string          `json:"updated_at"`
+	KeyDeliveryID string          `json:"key_delivery_id,omitempty"`
 }
 
 type ControlEvent struct {
@@ -152,14 +172,16 @@ type File struct {
 }
 
 type KeyDelivery struct {
-	ID           string `json:"id"`
-	GroupID      string `json:"group_id"`
-	SenderID     string `json:"sender_id"`
-	RecipientID  string `json:"recipient_id"`
-	Epoch        uint64 `json:"epoch"`
-	Envelope     string `json:"envelope"`
-	CreatedAt    string `json:"created_at"`
-	Acknowledged bool   `json:"acknowledged"`
+	ID             string `json:"id"`
+	GroupID        string `json:"group_id"`
+	SenderID       string `json:"sender_id"`
+	RecipientID    string `json:"recipient_id"`
+	Epoch          uint64 `json:"epoch"`
+	Envelope       string `json:"envelope"`
+	CreatedAt      string `json:"created_at"`
+	Acknowledged   bool   `json:"acknowledged"`
+	AcknowledgedAt string `json:"acknowledged_at,omitempty"`
+	SenderJoinedAt string `json:"sender_joined_at,omitempty"`
 }
 
 type Idempotent struct {
@@ -382,7 +404,7 @@ func (s *Store) compactNonces() error {
 }
 
 func newState(nodeID string) State {
-	return State{Version: Version, NodeID: nodeID, ServerCode: newServerCode(nodeID), DeviceNonces: map[string]int64{}, Devices: map[string]Device{}, Groups: map[string]Group{}, Invites: map[string]Invite{}, Applications: map[string]Application{}, Idempotency: map[string]Idempotent{}, Messages: map[string][]Message{}, KeyDeliveries: map[string][]KeyDelivery{}, Files: map[string]File{}}
+	return State{Version: Version, NodeID: nodeID, ServerCode: newServerCode(nodeID), DeviceNonces: map[string]int64{}, Devices: map[string]Device{}, Groups: map[string]Group{}, PairingTerminals: map[string]PairingTerminal{}, MembershipTerminals: map[string]map[string]MembershipTerminal{}, Invites: map[string]Invite{}, Applications: map[string]Application{}, Idempotency: map[string]Idempotent{}, Messages: map[string][]Message{}, KeyDeliveries: map[string][]KeyDelivery{}, Files: map[string]File{}}
 }
 
 func newServerCode(nodeID string) string {
@@ -421,6 +443,14 @@ func (s *State) normalize() (bool, error) {
 	}
 	if s.Groups == nil {
 		s.Groups = map[string]Group{}
+		changed = true
+	}
+	if s.PairingTerminals == nil {
+		s.PairingTerminals = map[string]PairingTerminal{}
+		changed = true
+	}
+	if s.MembershipTerminals == nil {
+		s.MembershipTerminals = map[string]map[string]MembershipTerminal{}
 		changed = true
 	}
 	if s.Invites == nil {

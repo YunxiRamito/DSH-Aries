@@ -141,6 +141,8 @@ Authorization: Bearer <admin-token>
 
 从 0.0.3 起，`capabilities` 声明 `group_applications`（申请列表）、`device_public_key`（申请和成员的注册公钥）、`device_name`（已签名心跳上传名称及申请/成员读取）、`device_presence`（心跳和 presence）、`group_file_cache_cleanup`（按组缓存统计和清理）。缓存清理仍受 `file_storage_enabled` 及权限约束；能力声明不代表授权。客户端忽略不认识的能力；旧服务器缺少数组时，不发送新 `device_name` 字段，也不能仅因此判断已存在的申请列表不受支持。
 
+0.0.4 追加 `pairing_key_confirmation`、`pairing_unpair`、`group_key_confirmation`、`group_lifecycle`、`group_invite_rotation`。确切 JSON、客户端状态判定和多人流程见 [PAIRING-LIFECYCLE.md](PAIRING-LIFECYCLE.md)。能力数组类型保持不变。
+
 ### 4.2 邀请、申请和入群
 
 | 方法和路径 | 请求体 | 成功响应与约束 |
@@ -210,6 +212,25 @@ Authorization: Bearer <admin-token>
 | `POST /groups/{group}/key-deliveries/{delivery}/ack` | 空 body 或 `{}` | `200`：`delivery_id`、`status:"acknowledged"`。只有指定 recipient 可确认。 |
 
 KeyDelivery 对象包含 `id`、`group_id`、`sender_id`、`recipient_id`、`epoch`、`envelope`、`created_at`、`acknowledged`。确认后再次读取未确认列表时不会再出现该项。
+
+0.0.4 首次 recipient ack 保存 `acknowledged_at`，成功 ack 响应保留原字段并增加该时间；重复 ack 不修改首次时间。申请详情/列表、成员列表及 join 投递响应增加 `key_confirmation_status`（`unknown`、`awaiting_ack`、`acknowledged`、`revoked`）及适用时的 `key_delivery_id`、`key_recipient_id`、`key_epoch`、`confirmed_at`。这些确认字段不包含信封。`approved` 仍表示已投递并授予成员资格；只有持久 ack 且当前成员/代次绑定有效才返回 `acknowledged`。历史记录没有可靠绑定时为 `unknown`；离开/撤销、再加入、代次改变或 pending rotation 后旧确认不能当作当前确认。creator/rotation author 没有收件投递时为 `unknown`。成员列表跟随当前 join 或 rotation 信封，历史申请仍绑定原 join；详见生命周期文档。
+
+### 4.5.1 配对取消、通用成员退出与整组关闭
+
+以下新写接口都使用原设备签名和稳定 `Idempotency-Key`；GET 使用签名但不要求幂等 key。
+
+| 方法和路径 | 请求 | 成功响应与权限 |
+|---|---|---|
+| `POST /groups/{group}/unpair` | `{}` | `200`：`group_id`、本人 `device_id`、`status:"unpaired"`。任一活跃成员可关闭恰好双活跃成员组；其他人数 `409 pair_not_two_devices`。待 ack 时也可取消。 |
+| `GET /groups/{group}/pairing-status` | 无 body | 活跃成员：`200`、本人 `group_id/device_id/status:"active"`；通过 unpair 关闭后仅原两参与者可读 `status:"unpaired"`、`unpaired_at`。 |
+| `POST /groups/{group}/disconnect` | `{}`，或 creator 的 `{"transfer_creator_to":"dev_..."}` | 本人退出、其他成员继续：`202`、`group_id/device_id/status:"left"/creator_id/control_event_id/required_generation`；最后成员：`200 group_closed`。creator 有其他成员时必须显式指定活跃接任者，转让及退出同事务提交。 |
+| `POST /groups/{group}/close` | `{}` | `200`：`group_id`、本人 `device_id`、`status:"group_closed"`。仅 creator 解散整组，任意人数均可。 |
+| `GET /groups/{group}/membership-status` | 无 body | 本人当前活跃时返回 `group_id/device_id/status:"active"/role/generation`；本人历史退出终态为 `left`、`revoked` 或 `group_closed`，附 `changed_at`。 |
+| `POST /groups/{group}/invites/rotate` | `{"replace_code":"224Y-123456"}` | `201`：`group_id/invite_code/expires_at/replaced_invite_code`。仅本组活跃 inviter 本人或 creator/admin 可原子替换指定邀请码，不影响其他码或已提交申请。 |
+
+关闭事务同时撤销该组授权、邀请码/申请/密钥投递/消息/控制事件并 tombstone 文件；全局设备、公钥、名称、presence 和其他组保留。物理文件由后台 janitor 异步清理，`200` 不声称磁盘已清空。本人退出则保留其他成员和原 `member_left` 轮换事件；剩余成员仍须执行 rotation。原 leave/revoke 的权限和响应不变，并在同事务记录可读的本人退出/撤销收据。
+
+幂等响应和终态跨重启持久保留；客户端核对完整 group/device/status 后再更新本地绑定，不把任何 404 或 offline 当作取消。已退出后重新加入同一组时，旧操作幂等回包仍是历史成功，不会退出新成员资格；客户端 pending 操作必须绑定本地会话版本，并以当前 `membership-status` 复核。新接口错误码和精确 body 规则见生命周期文档。旧群组人数模型未限制，邀请创建仍允许多个有效码；只有显式 rotate 会撤销指定码。
 
 ### 4.6 群组消息
 
@@ -292,3 +313,5 @@ KeyDelivery 对象包含 `id`、`group_id`、`sender_id`、`recipient_id`、`epo
 2026-10-12，0.0.3 已部署并从 Windows 本地严格校验 CA/IP SAN 的公网 HTTPS 入口完成 44 项响应检查，覆盖注册、名称、申请分页、批准/拒绝、opaque 信封投递/确认、三成员小组、跨组/撤销边界及测试组关闭；结果和实际健康响应见 [LAUNCHER-PAIRING.md](LAUNCHER-PAIRING.md)。这些测试不代表所有生产路由逐一验证，也不代表 Windows/Android 真实内容密钥加解密和完整文件流程已联调完成。
 
 路由注册和数据结构以 `internal/kernel/server.go`、`internal/kernel/public.go`、`internal/kernel/files.go`、`internal/kernel/commands.go` 和 `internal/store/store.go` 为实现依据。专题说明：[CLIENT-PROTOCOL.md](CLIENT-PROTOCOL.md)、[FILE-TRANSFER.md](FILE-TRANSFER.md)、[ADMIN-COMMANDS.md](ADMIN-COMMANDS.md)。
+
+0.0.4 已实现并测试双设备原子取消、通用小组原子转让并退出/creator 整组关闭、持久化本人成员终态、当前 join/rotation 投递确认和明确指定的邀请码替换。全量测试与 vet 通过，2026-10-12 从公网严格 TLS 入口完成 84 项响应检查；确切结果、实际 health/node JSON、回滚限制及客户端接续见 [PAIRING-LIFECYCLE.md](PAIRING-LIFECYCLE.md)。线上验证不是实际两个客户端 UI 或内容密钥加解密验收。

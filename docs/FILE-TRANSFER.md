@@ -8,6 +8,8 @@ The transfer routes are registered by `(*Server).PublicHandler()` through `s.reg
 
 The server process starts one expiry worker and cancels it during shutdown. Cleanup also runs when creating, downloading, acknowledging, or deleting transfers. A leave or revoke removes that member from outstanding target lists in the same state transaction that deactivates the membership. An uploading transfer is tombstoned when its sender leaves or is revoked; an already available transfer remains available to its recipients. Closing a group tombstones chunked transfers in the same transaction; the cleanup worker then removes their blobs while preserving tombstone metadata for retry/no-copy reporting.
 
+Build 0.0.4 adds explicit creator-only group close and double-member unpair, plus atomic creator-transfer-and-disconnect. Closure holds the existing file lock before the store lock, so upload/finalize/download cannot authorize a new operation across a committed close or resurrect a closed group. The success response confirms logical closure and tombstones, not immediate physical deletion. The janitor keeps retrying cleanup even when file storage is disabled. Other groups' files and control events are untouched. See [PAIRING-LIFECYCLE.md](PAIRING-LIFECYCLE.md).
+
 ## API
 
 All paths below are under `/api/v1/public`; every request needs the normal Ed25519 device-proof headers. Mutating requests also need an `Idempotency-Key`, and that key is part of the signed request.

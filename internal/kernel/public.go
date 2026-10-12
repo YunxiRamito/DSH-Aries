@@ -73,7 +73,7 @@ func (s *Server) publicNodeInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"node_id": nodeID, "server_code": serverCode, "api_version": APIVersion,
-		"capabilities": []string{"group_applications", "device_public_key", "device_name", "device_presence", "group_file_cache_cleanup"},
+		"capabilities": []string{"group_applications", "device_public_key", "device_name", "device_presence", "group_file_cache_cleanup", "pairing_key_confirmation", "pairing_unpair", "group_key_confirmation", "group_lifecycle", "group_invite_rotation"},
 	})
 }
 
@@ -415,6 +415,7 @@ func (s *Server) applicationStatus(w http.ResponseWriter, r *http.Request) {
 			return fail(500, "device_identity_missing", "application device identity is not registered")
 		}
 		response := map[string]any{"application_id": app.ID, "device_id": app.DeviceID, "public_key": publicKey, "status": app.Status, "approvals": app.Approvals, "created_at": app.CreatedAt, "updated_at": app.UpdatedAt}
+		applicationKeyConfirmation(st, app).addTo(response)
 		if name := st.Devices[app.DeviceID].DeviceName; name != "" {
 			response["device_name"] = name
 		}
@@ -451,6 +452,7 @@ func (s *Server) applicationList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type applicationItem struct {
+		keyConfirmation
 		ApplicationID string `json:"application_id"`
 		DeviceID      string `json:"device_id"`
 		PublicKey     string `json:"public_key"`
@@ -492,7 +494,7 @@ func (s *Server) applicationList(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return fail(500, "device_identity_missing", "application device identity is not registered")
 			}
-			items = append(items, applicationItem{ApplicationID: app.ID, DeviceID: app.DeviceID, PublicKey: publicKey, DeviceName: st.Devices[app.DeviceID].DeviceName, Status: app.Status, CreatedAt: app.CreatedAt, UpdatedAt: app.UpdatedAt})
+			items = append(items, applicationItem{keyConfirmation: applicationKeyConfirmation(st, app), ApplicationID: app.ID, DeviceID: app.DeviceID, PublicKey: publicKey, DeviceName: st.Devices[app.DeviceID].DeviceName, Status: app.Status, CreatedAt: app.CreatedAt, UpdatedAt: app.UpdatedAt})
 		}
 		if hasMore && len(apps) > 0 {
 			last := apps[len(apps)-1]
@@ -613,14 +615,21 @@ func (s *Server) deliverJoinKey(w http.ResponseWriter, r *http.Request) {
 		if app.Status != "awaiting_key" {
 			return 0, nil, fail(409, "application_state", "application is not awaiting key delivery")
 		}
-		g.Members[app.DeviceID] = store.Member{DeviceID: app.DeviceID, Role: "member", Active: true, JoinedAt: time.Now().UTC().Format(time.RFC3339)}
+		id, err := randomID("kd_")
+		if err != nil {
+			return 0, nil, err
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		g.Members[app.DeviceID] = store.Member{DeviceID: app.DeviceID, Role: "member", Active: true, JoinedAt: now, KeyDeliveryID: id}
 		st.Groups[group] = g
-		id, _ := randomID("kd_")
-		st.KeyDeliveries[group] = append(st.KeyDeliveries[group], store.KeyDelivery{ID: id, GroupID: group, SenderID: device, RecipientID: app.DeviceID, Epoch: g.Generation, Envelope: req.Envelope, CreatedAt: time.Now().UTC().Format(time.RFC3339)})
+		st.KeyDeliveries[group] = append(st.KeyDeliveries[group], store.KeyDelivery{ID: id, GroupID: group, SenderID: device, RecipientID: app.DeviceID, Epoch: g.Generation, Envelope: req.Envelope, CreatedAt: now, SenderJoinedAt: m.JoinedAt})
 		app.Status = "approved"
-		app.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		app.UpdatedAt = now
+		app.KeyDeliveryID = id
 		st.Applications[appID] = app
-		return 201, map[string]any{"application_id": appID, "status": "approved", "member_device_id": app.DeviceID, "generation": g.Generation}, nil
+		response := map[string]any{"application_id": appID, "status": "approved", "member_device_id": app.DeviceID, "generation": g.Generation}
+		applicationKeyConfirmation(*st, app).addTo(response)
+		return 201, response, nil
 	})
 }
 
@@ -746,6 +755,11 @@ func (s *Server) leaveGroup(w http.ResponseWriter, r *http.Request) {
 		if device == g.CreatorID && others > 0 {
 			return 0, nil, fail(409, "creator_transfer_required", "creator must transfer the creator role before leaving")
 		}
+		exitStatus := "left"
+		if others == 0 {
+			exitStatus = "group_closed"
+		}
+		RecordMembershipExit(st, group, device, exitStatus, member.Role, time.Now().UTC().Format(time.RFC3339Nano))
 		member.Active = false
 		g.Members[device] = member
 		RemoveFileTarget(st, group, device)
@@ -910,6 +924,7 @@ func (s *Server) revokeMember(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return 0, nil, err
 		}
+		RecordMembershipExit(st, group, target, "revoked", member.Role, time.Now().UTC().Format(time.RFC3339Nano))
 		st.Groups[group] = g
 		return 202, map[string]any{"group_id": group, "device_id": target, "status": "revoked", "control_event_id": event.ID, "required_generation": event.RequiredEpoch}, nil
 	})
@@ -973,9 +988,16 @@ func (s *Server) ackKeyDelivery(w http.ResponseWriter, r *http.Request) {
 				if d.RecipientID != device {
 					return 0, nil, fail(403, "delivery_recipient_mismatch", "only the intended recipient may acknowledge a key delivery")
 				}
-				d.Acknowledged = true
+				if !d.Acknowledged {
+					d.AcknowledgedAt = time.Now().UTC().Format(time.RFC3339Nano)
+					d.Acknowledged = true
+				}
 				st.KeyDeliveries[group][i] = d
-				return 200, map[string]any{"delivery_id": id, "status": "acknowledged"}, nil
+				response := map[string]any{"delivery_id": id, "status": "acknowledged"}
+				if d.AcknowledgedAt != "" {
+					response["acknowledged_at"] = d.AcknowledgedAt
+				}
+				return 200, response, nil
 			}
 		}
 		return 0, nil, fail(404, "delivery_not_found", "key delivery not found")
@@ -1005,6 +1027,7 @@ func (s *Server) memberList(w http.ResponseWriter, r *http.Request) {
 					return fail(500, "device_identity_missing", "member device identity is not registered")
 				}
 				item := map[string]any{"device_id": member.DeviceID, "public_key": publicKey, "role": member.Role, "active": member.Active, "joined_at": member.JoinedAt}
+				memberKeyConfirmation(st, g, member).addTo(item)
 				if name := st.Devices[member.DeviceID].DeviceName; name != "" {
 					item["device_name"] = name
 				}
@@ -1171,9 +1194,19 @@ func (s *Server) completeRotation(w http.ResponseWriter, r *http.Request) {
 		g.Generation = req.Epoch
 		rotation := store.Rotation{EventID: eventID, Epoch: req.Epoch, Envelopes: req.Envelopes, CompletedAt: now}
 		g.Rotations[eventID] = rotation
+		// The author owns the newly generated content key, but does not
+		// receive or acknowledge a server-delivered envelope for this epoch.
+		member.KeyDeliveryID = ""
+		g.Members[device] = member
 		for recipient, envelope := range req.Envelopes {
-			id, _ := randomID("kd_")
-			st.KeyDeliveries[group] = append(st.KeyDeliveries[group], store.KeyDelivery{ID: id, GroupID: group, SenderID: device, RecipientID: recipient, Epoch: req.Epoch, Envelope: envelope, CreatedAt: now})
+			id, err := randomID("kd_")
+			if err != nil {
+				return 0, nil, err
+			}
+			st.KeyDeliveries[group] = append(st.KeyDeliveries[group], store.KeyDelivery{ID: id, GroupID: group, SenderID: device, RecipientID: recipient, Epoch: req.Epoch, Envelope: envelope, CreatedAt: now, SenderJoinedAt: member.JoinedAt})
+			recipientMember := g.Members[recipient]
+			recipientMember.KeyDeliveryID = id
+			g.Members[recipient] = recipientMember
 		}
 		st.Groups[group] = g
 		return 200, map[string]any{"event_id": eventID, "status": "completed", "generation": g.Generation}, nil
@@ -1198,6 +1231,9 @@ func (s *Server) keyDeliveries(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, d := range st.KeyDeliveries[group] {
 			if d.RecipientID == device && !d.Acknowledged {
+				// Membership binding is internal receipt bookkeeping, not
+				// part of the public opaque-envelope delivery contract.
+				d.SenderJoinedAt = ""
 				items = append(items, d)
 			}
 		}
