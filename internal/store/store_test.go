@@ -165,3 +165,53 @@ func TestUpdateDoesNotPublishFailedTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDeviceNamePersistsAndFailedRenameIsNotPublished(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, err := Open(path, "node_device_name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Update(func(state *State) error {
+		state.Devices["dev_test"] = Device{ID: "dev_test", PublicKey: "registered-public-key", CreatedAt: "2026-10-12T00:00:00Z"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetDeviceName("dev_test", "OPPO Find X8"); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, "ignored")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	check := func(st *Store) {
+		t.Helper()
+		if err := st.View(func(state State) error {
+			d := state.Devices["dev_test"]
+			if d.DeviceName != "OPPO Find X8" || d.ID != "dev_test" || d.PublicKey != "registered-public-key" || d.CreatedAt != "2026-10-12T00:00:00Z" {
+				t.Fatalf("name update changed identity or did not persist: %#v", d)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(reopened)
+	// A file cannot serve as a directory. A no-op should still succeed without
+	// attempting a snapshot write, while a genuine rename must fail atomically.
+	s.path = filepath.Join(path, "cannot-write.json")
+	if err := s.SetDeviceName("dev_test", "OPPO Find X8"); err != nil {
+		t.Fatalf("unchanged name attempted to persist: %v", err)
+	}
+	if err := s.SetDeviceName("dev_test", "Uncommitted rename"); err == nil {
+		t.Fatal("expected failed snapshot write")
+	}
+	check(s)
+	s.path = path
+	if err := s.SetDeviceName("dev_missing", "Unknown"); err == nil {
+		t.Fatal("unknown device identity accepted a display name")
+	}
+}

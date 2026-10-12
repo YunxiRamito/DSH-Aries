@@ -2,31 +2,31 @@
 
 DSH-Aries is a Go relay server for end-to-end encrypted device and group data, with a bilingual terminal management CLI (`ariesctl`). The server stores opaque ciphertext and encrypted key envelopes; clients keep device private keys and group content keys.
 
-**Version:** `0.0.2` · **API:** `v1` · **Status:** early single-node release
+**Version:** `0.0.3` · **API:** `v1` · **Status:** early single-node release
 
 This release is an integration prototype. It has a durable JSON state store and filesystem-backed file transfer, but no database backend, WebSocket transport, peer relay, or multi-node federation. Review [API implementation limits](docs/API-REFERENCE.md#7-当前实现与验证边界) before exposing a deployment to users.
 
-## Download 0.0.2
+## Download 0.0.3
 
-Release binaries are published at [GitHub Releases](https://github.com/YunxiRamito/DSH-Aries/releases/tag/v0.0.2). The release contains the server and management CLI for Linux amd64, Linux arm64, and Windows amd64. Verify downloads against `SHA256SUMS.txt`.
+Release binaries are published at [GitHub Releases](https://github.com/YunxiRamito/DSH-Aries/releases/tag/v0.0.3). The release contains the server and management CLI for Linux amd64, Linux arm64, and Windows amd64. Verify downloads against `SHA256SUMS.txt`.
 
 | Platform | Server | Management CLI |
 |---|---|---|
-| Linux amd64 | `aries-server-v0.0.2-linux-amd64` | `ariesctl-v0.0.2-linux-amd64` |
-| Linux arm64 | `aries-server-v0.0.2-linux-arm64` | `ariesctl-v0.0.2-linux-arm64` |
-| Windows amd64 | `aries-server-v0.0.2-windows-amd64.exe` | `ariesctl-v0.0.2-windows-amd64.exe` |
+| Linux amd64 | `aries-server-v0.0.3-linux-amd64` | `ariesctl-v0.0.3-linux-amd64` |
+| Linux arm64 | `aries-server-v0.0.3-linux-arm64` | `ariesctl-v0.0.3-linux-arm64` |
+| Windows amd64 | `aries-server-v0.0.3-windows-amd64.exe` | `ariesctl-v0.0.3-windows-amd64.exe` |
 
 ## Deploy on Linux
 
 The example below installs the service under `/opt/dsh-aries`, keeps config and the admin token under `/etc/dsh-aries`, and writes durable data under `/var/lib/dsh-aries`. It binds both listeners to loopback. Put a TLS reverse proxy in front of the **public** listener; keep the admin listener private.
 
-1. Download `aries-server-v0.0.2-linux-amd64` (or the matching architecture) from the release page and install it:
+1. Download `aries-server-v0.0.3-linux-amd64` (or the matching architecture) from the release page and install it:
 
    ```sh
    sudo useradd --system --home-dir /var/lib/dsh-aries --shell /usr/sbin/nologin dsh-aries
    sudo install -d -o root -g dsh-aries -m 0750 /etc/dsh-aries
    sudo install -d -o dsh-aries -g dsh-aries -m 0750 /opt/dsh-aries /var/lib/dsh-aries
-   sudo install -o root -g dsh-aries -m 0750 aries-server-v0.0.2-linux-amd64 /opt/dsh-aries/aries-server
+   sudo install -o root -g dsh-aries -m 0750 aries-server-v0.0.3-linux-amd64 /opt/dsh-aries/aries-server
    ```
 
 2. Create an administrator token and the config file. Keep the token out of source control and logs:
@@ -108,7 +108,7 @@ The public service port defaults to `8787`; the admin port defaults to `8788`. T
 Download the Windows amd64 server binary, create a protected directory such as `C:\ProgramData\DSH-Aries`, and create a token with `ariesctl token create --out C:\ProgramData\DSH-Aries\admin.token`. Create `config.json` using the same fields as the Linux example, with Windows absolute paths, and set `data_dir` to a directory writable by the service account. Start the server in PowerShell:
 
 ```powershell
-.\aries-server-v0.0.2-windows-amd64.exe serve --config C:\ProgramData\DSH-Aries\config.json
+.\aries-server-v0.0.3-windows-amd64.exe serve --config C:\ProgramData\DSH-Aries\config.json
 ```
 
 For unattended startup, register that command in Windows Task Scheduler under a dedicated account with access only to the config, token, and data directories. The release does not include a Windows Service wrapper. As on Linux, keep the admin listener on loopback and terminate public TLS at a reverse proxy.

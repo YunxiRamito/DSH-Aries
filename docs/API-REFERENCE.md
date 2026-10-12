@@ -80,7 +80,7 @@ Idempotency-Key: <8–128 字符>
 
 空请求体的哈希是空字节串的 SHA-256。签名必须覆盖实际发送的请求体字节，不能先解析再重新序列化 JSON 后签名。时间戳允许与服务器时间相差最多五分钟。设备 nonce 只允许使用一次，服务端持久保存其哈希以便重启后仍能拒绝重放。
 
-每个已认证的写操作均要求 `Idempotency-Key`。相同设备、操作、key 和请求体的重试返回第一次保存的 HTTP 状态码和响应体；相同操作重用 key 但请求体不同会返回 `409 idempotency_conflict`。发生网络超时、客户端未收到响应等结果不确定的情况，使用原 key 和原请求体重试。新业务操作必须生成新 key。
+除设备心跳外，已认证的写操作均要求 `Idempotency-Key`。相同设备、操作、key 和请求体的重试返回第一次保存的 HTTP 状态码和响应体；相同操作重用 key 但请求体不同会返回 `409 idempotency_conflict`。发生网络超时、客户端未收到响应等结果不确定的情况，使用原 key 和原请求体重试。新业务操作必须生成新 key。心跳按服务端当前接收时间刷新在线状态，并按当前请求更新可选设备名称，不缓存幂等响应；重试必须使用新的 nonce 和签名。
 
 ### 2.3 管理 API 认证
 
@@ -126,18 +126,20 @@ Authorization: Bearer <admin-token>
 
 ## 4. 公开设备和群组 API
 
-以下路径均以 `/api/v1/public` 为前缀。除表中标记为“公开”的路径外，都必须带设备请求证明；所有写操作都必须带 `Idempotency-Key`。示例中的 `{group}`、`{code}`、`{application}`、`{member}`、`{event}`、`{delivery}` 是路径参数，客户端应按 URL path segment 编码。
+以下路径均以 `/api/v1/public` 为前缀。除表中标记为“公开”的路径外，都必须带设备请求证明；写操作除 challenge 和 heartbeat 外都必须带 `Idempotency-Key`。示例中的 `{group}`、`{code}`、`{application}`、`{member}`、`{event}`、`{delivery}` 是路径参数，客户端应按 URL path segment 编码。
 
 ### 4.1 节点和设备
 
 | 方法和路径 | 认证 | 请求 | 成功响应 |
 |---|---|---|---|
 | `GET /healthz` | 公开 | 无 | `status`、`api_version`、`build_version`、`started_at` |
-| `GET /node` | 公开 | 无 | `node_id`、`server_code`、`api_version` |
+| `GET /node` | 公开 | 无 | `node_id`、`server_code`、`api_version`、`capabilities` 字符串数组 |
 | `POST /devices/challenge` | 公开 | `public_key` 或 `device_id` 二选一 | `challenge_id`、`nonce`、`expires_at` |
 | `POST /devices/enroll` | enroll challenge 签名 + 幂等 key | `challenge_id`、`signature` | `device_id`、`status`；首次注册 `201`，已有相同设备 `200` |
 
 公钥必须是 32 字节 Ed25519 公钥的无填充 base64url。设备 ID 为 `dev_` 加公钥 SHA-256 前 16 字节的小写十六进制。`server_code` 是供人识别的短码，可能碰撞；协议识别节点时必须使用完整 `node_id`。
+
+从 0.0.3 起，`capabilities` 声明 `group_applications`（申请列表）、`device_public_key`（申请和成员的注册公钥）、`device_name`（已签名心跳上传名称及申请/成员读取）、`device_presence`（心跳和 presence）、`group_file_cache_cleanup`（按组缓存统计和清理）。缓存清理仍受 `file_storage_enabled` 及权限约束；能力声明不代表授权。客户端忽略不认识的能力；旧服务器缺少数组时，不发送新 `device_name` 字段，也不能仅因此判断已存在的申请列表不受支持。
 
 ### 4.2 邀请、申请和入群
 
@@ -148,7 +150,7 @@ Authorization: Bearer <admin-token>
 | `GET /invites/{code}` | 公开，无 body | `200`：`group_id`、`group_name`、`authority_node`、`member_count`、`approval_policy`、`expires_at`。仅返回展示信息。 |
 | `POST /invites/{code}/applications` | 空 body 或 `{}` | `201`：`application_id`、`group_id`、`status`、`required_approvals`。邀请必须尚未过期/撤销，设备不能已是活跃成员。 |
 | `GET /groups/{group}/applications` | query 可选 `status`、`cursor`、`limit` | `200`：`items`、`next_cursor`。仅群组活跃成员可读取；默认只返回 `pending_approval`、`awaiting_key`，排序为 `created_at` 升序再按 `application_id` 升序。 |
-| `GET /groups/{group}/applications/{application}` | 无 body | `200`：`application_id`、`device_id`、`public_key`、`status`、`approvals`、`created_at`、`updated_at`。申请人本人或群组活跃成员可查看。 |
+| `GET /groups/{group}/applications/{application}` | 无 body | `200`：`application_id`、`device_id`、`public_key`、可选 `device_name`、`status`、`approvals`、`created_at`、`updated_at`。申请人本人或群组活跃成员可查看。 |
 | `POST /groups/{group}/applications/{application}/approvals` | `{"approve":true}` 或 `false` | `200`：`application_id`、`status`、`approvals`。活跃成员须为此申请的审批人；群组 admin 可代行一个尚未处理的审批槽。拒绝后为 `rejected`，全部批准后为 `awaiting_key`。 |
 | `POST /groups/{group}/applications/{application}/key-delivery` | `{"envelope":"<opaque base64url>"}` | `201`：`application_id`、`status:"approved"`、`member_device_id`、`generation`。任何活跃成员可在申请为 `awaiting_key` 时提交加密信封；成员加入和信封入队原子提交。 |
 
@@ -156,13 +158,15 @@ Authorization: Bearer <admin-token>
 
 申请列表的 `limit` 默认 100、最大 200；`status` 可重复或使用逗号分隔，支持上述四种状态和 `all`。`cursor` 是服务端返回的不透明无填充 base64url 游标，客户端不得自行构造或解析；空 `next_cursor` 表示没有下一页。列表和详情中的 `public_key` 始终从已登记设备身份读取，并与 `device_id` 一致。
 
+申请列表和详情还从同一注册设备记录读取当前可选 `device_name`；未上传名称的设备省略该字段。名称变更不改变申请状态、排序时间、设备 ID 或公钥。
+
 信封是 opaque payload；服务端只存储和转交，不能解密内容密钥。加入设备通过 `GET /groups/{group}/key-deliveries` 获取未确认的密钥投递，见 4.5。
 
 ### 4.3 群组、成员、离开和轮换
 
 | 方法和路径 | 请求体 / query | 成功响应与权限 |
 |---|---|---|
-| `GET /groups/{group}/members` | 无 body | `200`：`{"items":[Member...]}`。仅活跃成员可读取；Member 字段为 `device_id`、`public_key`、`role`、`active`、`joined_at`。 |
+| `GET /groups/{group}/members` | 无 body | `200`：`{"items":[Member...]}`。仅活跃成员可读取；Member 字段为 `device_id`、`public_key`、可选 `device_name`、`role`、`active`、`joined_at`。名称和公钥均取自注册设备。 |
 | `PUT /groups/{group}/members/{member}/role` | `{"role":"admin"}` 或 `{"role":"member"}` | `200`：`group_id`、`device_id`、`role`。仅 creator 可调整其他活跃成员的角色；creator 角色必须通过下方转让接口转移。 |
 | `DELETE /groups/{group}/members/{member}` | 空 body 或 `{}` | `202`：`group_id`、`device_id`、`status:"revoked"`、`control_event_id`、`required_generation`。Creator 可撤销任一非 creator 成员（包括 admin）；admin 只能撤销普通成员。被撤销的成员立即失去群组访问权。 |
 | `POST /groups/{group}/creator` | `{"new_creator_id":"dev_..."}` | `200`：`group_id`、`creator_id`。仅当前 creator 可将角色转给一个活跃成员；原 creator 转成普通 member。 |
@@ -185,10 +189,18 @@ Authorization: Bearer <admin-token>
 
 | 方法和路径 | 请求体 | 成功响应与权限 |
 |---|---|---|
-| `POST /devices/heartbeat` | `{}` 或 `{"client_version":"launcher/1.0"}` | `200`：`device_id`、`online:true`、服务端生成的 `last_seen_at`、`expires_at`，以及可选 `client_version`。需要设备签名，不要求幂等 key。 |
+| `POST /devices/heartbeat` | `{}` 或 `{"client_version":"launcher/1.0","device_name":"OPPO Find X8"}` | `200`：`device_id`、`online:true`、服务端生成的 `last_seen_at`、`expires_at`、`client_version`（未提供时为空字符串），以及已登记非空 `device_name`。需要设备签名，不要求幂等 key。 |
 | `GET /groups/{group}/presence` | 无 body | `200`：`{"items":[...]}`。仅当前小组活跃成员可读，按 `device_id` 稳定排序。 |
 
 心跳时间由服务端接收时间决定，客户端不能提交或覆盖 `online`。presence 默认超时为 90 秒，心跳建议间隔为 30 秒；可通过 `heartbeat_interval_seconds` 和 `heartbeat_timeout_seconds` 配置，0 使用默认值。`client_version` 最多 64 字节且不得包含换行。返回项包含 `device_id`、`online`、`last_seen_at`，有版本时还包含 `client_version`；从未心跳的成员 `online:false` 且 `last_seen_at` 为空。在线状态只保存在进程内内存，服务重启后所有成员先报告离线，不从历史快照恢复。单进程最多保留 100,000 个设备记录，过期记录会在心跳时清理。成员离开或被撤销后立即失去 presence 读取权限，并从其小组结果中消失。
+
+### 4.4.1 设备展示名称
+
+`device_name` 是可选普通展示文本。服务端先拒绝原始名称中任何 Unicode 控制字符（包括换行、Tab、NUL），再去除两端 Unicode 空白；结果必须为 1–128 个 Unicode 字符，按字符而非 UTF-8 字节计数。空白名称、超长或控制字符返回 `400 invalid_device_name`，字段类型错误返回 `400 invalid_request`，均不更新名称或在线时间。遗漏字段或传 `null` 保留原名称；不支持用空字符串清空名称。
+
+名称仅能由设备本人的有效 Ed25519 签名心跳更新，存入注册设备记录；只有名称实际变化时才提交完整 JSON 快照。无名称或相同名称心跳不重写快照。快照写入失败返回 `500 storage_unavailable`，不发布未提交名称、不刷新该心跳在线状态；设备 nonce 的防重放 sidecar 仍按现有认证规则写入。名称会跨重启保留，presence 仍只在内存中。心跳重试重新签名（新 nonce），无需改 enrollment proof 或发送管理 token。
+
+名称由对端自行声明，可能重复或冒充某个型号；客户端展示名称时仍必须保留并校验设备 ID、公钥指纹和用户审批。名称不代替认证身份。首次连接确认 `/node.capabilities` 含 `device_name` 后可上传名称；具体 JSON 示例及接入顺序见 [LAUNCHER-PAIRING.md](LAUNCHER-PAIRING.md)。
 
 ### 4.5 密钥投递
 
@@ -275,6 +287,8 @@ KeyDelivery 对象包含 `id`、`group_id`、`sender_id`、`recipient_id`、`epo
 
 此 API 版本已实现单节点设备注册、群组邀请与审批、待处理申请列表、公钥读取、成员角色/撤销、设备心跳与小组 presence、持久事件、轮换信封、opaque 消息中继、可续传加密文件存储和按小组缓存清理。在线状态只存在内存，重启后从离线开始；缓存清理只写入文件 tombstone 并清理指定小组的 blob/上传临时目录，不影响控制事件、成员关系、设备身份或密钥投递。以下能力未实现：WebSocket、多节点 federation/复制/转发、跨节点邀请发现、数据库后端、群组审计日志、生产 TLS 证书管理和 peer relay。状态字段遇到未实现能力时会返回 `not_supported` 或 `not_implemented`，客户端不应假定它可用。
 
-当前自动化 API 测试使用进程内 `httptest` 服务端：覆盖了设备注册、群组入群/消息/离开/重启/轮换的主流程、申请列表和公钥边界、心跳过期/重启/撤销权限、挑战限流和签名 nonce 重放、管理认证/配置校验/命令 API，以及文件上传续传/下载/确认/配额/TTL/tombstone/按组缓存清理。它们验证服务端处理器和持久化行为，不等于对生产部署逐路由的线上验证。仍缺少直接 HTTP 路由测试的接口包括：邀请创建/查询、申请状态、事件 long-poll、角色更新、成员列表、密钥投递列表/确认、消息列表，以及管理端群组/存储查询、shutdown、成功的 REST 配置更新。服务器上的人工检查目前确认过管理端 `GET /status`；公开设备、群组、消息及文件全流程尚未在部署服务器完成端到端联调。
+当前自动化 API 测试使用进程内 `httptest` 服务端：覆盖了设备注册、群组入群/消息/离开/重启/轮换的主流程、申请列表和公钥边界、心跳过期/重启/撤销权限、挑战限流和签名 nonce 重放、管理认证/配置校验/命令 API，以及文件上传续传/下载/确认/配额/TTL/tombstone/按组缓存清理。0.0.3 增加了设备名称 roundtrip/Unicode 限制、旧心跳兼容与无快照重写、重启持久化、写入失败原子性、重新 enrollment 保留身份/名称，以及申请详情/批准/拒绝、成员列表、密钥投递/确认/ack 幂等、三成员小组和权限边界的直接 HTTP 路由测试。`go test ./...` 与 `go vet ./...` 均通过。
+
+2026-10-12，0.0.3 已部署并从 Windows 本地严格校验 CA/IP SAN 的公网 HTTPS 入口完成 44 项响应检查，覆盖注册、名称、申请分页、批准/拒绝、opaque 信封投递/确认、三成员小组、跨组/撤销边界及测试组关闭；结果和实际健康响应见 [LAUNCHER-PAIRING.md](LAUNCHER-PAIRING.md)。这些测试不代表所有生产路由逐一验证，也不代表 Windows/Android 真实内容密钥加解密和完整文件流程已联调完成。
 
 路由注册和数据结构以 `internal/kernel/server.go`、`internal/kernel/public.go`、`internal/kernel/files.go`、`internal/kernel/commands.go` 和 `internal/store/store.go` 为实现依据。专题说明：[CLIENT-PROTOCOL.md](CLIENT-PROTOCOL.md)、[FILE-TRANSFER.md](FILE-TRANSFER.md)、[ADMIN-COMMANDS.md](ADMIN-COMMANDS.md)。

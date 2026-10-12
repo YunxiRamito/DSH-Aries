@@ -71,7 +71,10 @@ func (s *Server) publicNodeInfo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusServiceUnavailable, "storage_unavailable", "node identity is temporarily unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"node_id": nodeID, "server_code": serverCode, "api_version": APIVersion})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"node_id": nodeID, "server_code": serverCode, "api_version": APIVersion,
+		"capabilities": []string{"group_applications", "device_public_key", "device_name", "device_presence", "group_file_cache_cleanup"},
+	})
 }
 
 func (s *Server) deviceChallenge(w http.ResponseWriter, r *http.Request) {
@@ -411,7 +414,11 @@ func (s *Server) applicationStatus(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return fail(500, "device_identity_missing", "application device identity is not registered")
 		}
-		writeJSON(w, 200, map[string]any{"application_id": app.ID, "device_id": app.DeviceID, "public_key": publicKey, "status": app.Status, "approvals": app.Approvals, "created_at": app.CreatedAt, "updated_at": app.UpdatedAt})
+		response := map[string]any{"application_id": app.ID, "device_id": app.DeviceID, "public_key": publicKey, "status": app.Status, "approvals": app.Approvals, "created_at": app.CreatedAt, "updated_at": app.UpdatedAt}
+		if name := st.Devices[app.DeviceID].DeviceName; name != "" {
+			response["device_name"] = name
+		}
+		writeJSON(w, 200, response)
 		return nil
 	})
 	if err != nil {
@@ -447,6 +454,7 @@ func (s *Server) applicationList(w http.ResponseWriter, r *http.Request) {
 		ApplicationID string `json:"application_id"`
 		DeviceID      string `json:"device_id"`
 		PublicKey     string `json:"public_key"`
+		DeviceName    string `json:"device_name,omitempty"`
 		Status        string `json:"status"`
 		CreatedAt     string `json:"created_at"`
 		UpdatedAt     string `json:"updated_at"`
@@ -484,7 +492,7 @@ func (s *Server) applicationList(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return fail(500, "device_identity_missing", "application device identity is not registered")
 			}
-			items = append(items, applicationItem{ApplicationID: app.ID, DeviceID: app.DeviceID, PublicKey: publicKey, Status: app.Status, CreatedAt: app.CreatedAt, UpdatedAt: app.UpdatedAt})
+			items = append(items, applicationItem{ApplicationID: app.ID, DeviceID: app.DeviceID, PublicKey: publicKey, DeviceName: st.Devices[app.DeviceID].DeviceName, Status: app.Status, CreatedAt: app.CreatedAt, UpdatedAt: app.UpdatedAt})
 		}
 		if hasMore && len(apps) > 0 {
 			last := apps[len(apps)-1]
@@ -996,7 +1004,11 @@ func (s *Server) memberList(w http.ResponseWriter, r *http.Request) {
 				if !ok {
 					return fail(500, "device_identity_missing", "member device identity is not registered")
 				}
-				items = append(items, map[string]any{"device_id": member.DeviceID, "public_key": publicKey, "role": member.Role, "active": member.Active, "joined_at": member.JoinedAt})
+				item := map[string]any{"device_id": member.DeviceID, "public_key": publicKey, "role": member.Role, "active": member.Active, "joined_at": member.JoinedAt}
+				if name := st.Devices[member.DeviceID].DeviceName; name != "" {
+					item["device_name"] = name
+				}
+				items = append(items, item)
 			}
 		}
 		sort.Slice(items, func(i, j int) bool { return items[i]["device_id"].(string) < items[j]["device_id"].(string) })

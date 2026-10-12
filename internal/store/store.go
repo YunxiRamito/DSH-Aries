@@ -50,9 +50,10 @@ type State struct {
 }
 
 type Device struct {
-	ID        string `json:"id"`
-	PublicKey string `json:"public_key"`
-	CreatedAt string `json:"created_at"`
+	ID         string `json:"id"`
+	PublicKey  string `json:"public_key"`
+	DeviceName string `json:"device_name,omitempty"`
+	CreatedAt  string `json:"created_at"`
 }
 
 type Group struct {
@@ -487,6 +488,36 @@ func (s *Store) Update(fn func(*State) error) error {
 	if err := fn(&copy); err != nil {
 		return err
 	}
+	if err := s.persist(copy); err != nil {
+		return err
+	}
+	s.data = copy
+	return nil
+}
+
+// SetDeviceName updates only an existing device's display name. Heartbeats
+// commonly repeat the same name; compare under the store lock so those calls
+// neither clone nor persist the complete snapshot. As with Update, a failed
+// durable write leaves the published device identity and name unchanged.
+func (s *Store) SetDeviceName(deviceID, name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	device, exists := s.data.Devices[deviceID]
+	if !exists || device.ID != deviceID {
+		return errors.New("device identity is not registered")
+	}
+	if device.DeviceName == name {
+		return nil
+	}
+	copy, err := clone(s.data)
+	if err != nil {
+		return err
+	}
+	device.DeviceName = name
+	copy.Devices[deviceID] = device
 	if err := s.persist(copy); err != nil {
 		return err
 	}
